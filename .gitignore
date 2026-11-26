@@ -1,0 +1,6 @@
+/target
+/.cargo/config.toml
+*.swp
+*.swo
+.DS_Store
+dist/

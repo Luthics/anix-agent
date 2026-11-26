@@ -1,0 +1,43 @@
+[package]
+name = "anix-agent"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Lightweight POSIX-native interactive terminal workbench (Layer 3) for the Anix OS Agent kernel"
+license = "Apache-2.0"
+repository = "https://github.com/Luthics/anix-agent"
+authors = ["Luthics <27689212+Luthics@users.noreply.github.com>"]
+
+[[bin]]
+name = "anix-agent"
+path = "src/main.rs"
+
+[dependencies]
+anix-proto = { git = "https://github.com/Luthics/anix.git", branch = "main" }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+libc = "0.2"
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting"] }
+unicode-width = "0.2"
+uuid = { version = "1", features = ["v4"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+opt-level = 3
