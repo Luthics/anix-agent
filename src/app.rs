@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::backend::{Backend, ClearType, WindowSize};
+use ratatui::buffer::Cell;
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget};
@@ -39,6 +40,181 @@ use crate::worker::{
 
 const VIEWPORT_HEIGHT: u16 = 13;
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// CJK-safe Crossterm backend fixing `ratatui 0.29`'s `Terminal::insert_before` (`draw_lines`)
+/// bug where double-width CJK/emoji trailing placeholder cells are emitted as literal spaces,
+/// causing wide gaps between Chinese characters and right-edge line clipping.
+struct CjkSafeBackend<W: io::Write> {
+    writer: W,
+}
+
+impl<W: io::Write> CjkSafeBackend<W> {
+    fn new(writer: W) -> Self {
+        Self { writer }
+    }
+}
+
+impl<W: io::Write> Backend for CjkSafeBackend<W> {
+    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        use crossterm::cursor::MoveTo;
+        use crossterm::queue;
+        use crossterm::style::{
+            Attribute, Color as CColor, Colors, Print, SetAttribute, SetBackgroundColor, SetColors,
+            SetForegroundColor,
+        };
+
+        let writer = &mut self.writer;
+        let mut fg = Color::Reset;
+        let mut bg = Color::Reset;
+        let mut modifier = Modifier::empty();
+        // Track the terminal's ACTUAL cursor position (accounting for multi-width glyphs!)
+        // so consecutive CJK characters emit as a contiguous UTF-8 stream with zero MoveTo churn.
+        let mut cursor_pos: Option<(u16, u16)> = None;
+        let mut current_row: Option<u16> = None;
+        let mut skip_until_x: u16 = 0;
+
+        for (x, y, cell) in content {
+            if current_row != Some(y) {
+                current_row = Some(y);
+                skip_until_x = 0;
+            }
+            if cell.skip || (x < skip_until_x && cell.symbol() == " ") {
+                continue;
+            }
+
+            if cursor_pos != Some((x, y)) {
+                queue!(writer, MoveTo(x, y))?;
+            }
+
+            if cell.modifier != modifier {
+                let removed = modifier - cell.modifier;
+                if removed.contains(Modifier::REVERSED) {
+                    queue!(writer, SetAttribute(Attribute::NoReverse))?;
+                }
+                if removed.contains(Modifier::BOLD) || removed.contains(Modifier::DIM) {
+                    queue!(writer, SetAttribute(Attribute::NormalIntensity))?;
+                }
+                if removed.contains(Modifier::ITALIC) {
+                    queue!(writer, SetAttribute(Attribute::NoItalic))?;
+                }
+                if removed.contains(Modifier::UNDERLINED) {
+                    queue!(writer, SetAttribute(Attribute::NoUnderline))?;
+                }
+                if removed.contains(Modifier::CROSSED_OUT) {
+                    queue!(writer, SetAttribute(Attribute::NotCrossedOut))?;
+                }
+
+                let added = cell.modifier - modifier;
+                if added.contains(Modifier::REVERSED) {
+                    queue!(writer, SetAttribute(Attribute::Reverse))?;
+                }
+                if added.contains(Modifier::BOLD)
+                    || (removed.contains(Modifier::DIM) && cell.modifier.contains(Modifier::BOLD))
+                {
+                    queue!(writer, SetAttribute(Attribute::Bold))?;
+                }
+                if added.contains(Modifier::DIM)
+                    || (removed.contains(Modifier::BOLD) && cell.modifier.contains(Modifier::DIM))
+                {
+                    queue!(writer, SetAttribute(Attribute::Dim))?;
+                }
+                if added.contains(Modifier::ITALIC) {
+                    queue!(writer, SetAttribute(Attribute::Italic))?;
+                }
+                if added.contains(Modifier::UNDERLINED) {
+                    queue!(writer, SetAttribute(Attribute::Underlined))?;
+                }
+                if added.contains(Modifier::CROSSED_OUT) {
+                    queue!(writer, SetAttribute(Attribute::CrossedOut))?;
+                }
+                modifier = cell.modifier;
+            }
+
+            if cell.fg != fg || cell.bg != bg {
+                queue!(
+                    writer,
+                    SetColors(Colors::new(cell.fg.into(), cell.bg.into()))
+                )?;
+                fg = cell.fg;
+                bg = cell.bg;
+            }
+
+            let sym = cell.symbol();
+            queue!(writer, Print(sym))?;
+
+            let w = sym.width().max(1) as u16;
+            skip_until_x = x.saturating_add(w);
+            cursor_pos = Some((x.saturating_add(w), y));
+        }
+
+        queue!(
+            writer,
+            SetForegroundColor(CColor::Reset),
+            SetBackgroundColor(CColor::Reset),
+            SetAttribute(Attribute::Reset),
+        )
+    }
+
+    fn append_lines(&mut self, n: u16) -> io::Result<()> {
+        for _ in 0..n {
+            crossterm::queue!(self.writer, crossterm::style::Print("\n"))?;
+        }
+        self.writer.flush()
+    }
+
+    fn hide_cursor(&mut self) -> io::Result<()> {
+        crossterm::execute!(self.writer, crossterm::cursor::Hide)
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        crossterm::execute!(self.writer, crossterm::cursor::Show)
+    }
+
+    fn get_cursor_position(&mut self) -> io::Result<Position> {
+        crossterm::cursor::position().map(|(x, y)| Position::new(x, y))
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+        let p = position.into();
+        crossterm::execute!(self.writer, crossterm::cursor::MoveTo(p.x, p.y))
+    }
+
+    fn clear(&mut self) -> io::Result<()> {
+        self.clear_region(ClearType::All)
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+        let ct = match clear_type {
+            ClearType::All => crossterm::terminal::ClearType::All,
+            ClearType::AfterCursor => crossterm::terminal::ClearType::FromCursorDown,
+            ClearType::BeforeCursor => crossterm::terminal::ClearType::FromCursorUp,
+            ClearType::CurrentLine => crossterm::terminal::ClearType::CurrentLine,
+            ClearType::UntilNewLine => crossterm::terminal::ClearType::UntilNewLine,
+        };
+        crossterm::execute!(self.writer, crossterm::terminal::Clear(ct))
+    }
+
+    fn size(&self) -> io::Result<Size> {
+        crossterm::terminal::size().map(|(w, h)| Size::new(w, h))
+    }
+
+    fn window_size(&mut self) -> io::Result<WindowSize> {
+        let ws = crossterm::terminal::window_size()?;
+        Ok(WindowSize {
+            columns_rows: Size::new(ws.columns, ws.rows),
+            pixels: Size::new(ws.width, ws.height),
+        })
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+type UiTerminal = Terminal<CjkSafeBackend<Stdout>>;
 
 enum AppEvent {
     Key(KeyEvent),
@@ -224,7 +400,7 @@ pub fn run_interactive(cli: Cli) -> Result<(), Box<dyn Error>> {
 
     // Enter raw mode & allocate Inline viewport (NO alternate screen hijack!).
     let _guard = TerminalGuard::enter()?;
-    let backend = CrosstermBackend::new(io::stdout());
+    let backend = CjkSafeBackend::new(io::stdout());
     let mut terminal = Terminal::with_options(
         backend,
         TerminalOptions {
@@ -343,17 +519,17 @@ pub fn run_interactive(cli: Cli) -> Result<(), Box<dyn Error>> {
 }
 
 impl Workbench {
-    fn term_width(&self, terminal: &Terminal<CrosstermBackend<Stdout>>) -> usize {
+    fn term_width(&self, terminal: &UiTerminal) -> usize {
         terminal
             .size()
-            .map(|s| s.width as usize)
-            .unwrap_or(80)
+            .map(|s| (s.width as usize).saturating_sub(1))
+            .unwrap_or(79)
             .max(30)
     }
 
     fn push_lines(
         &self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut Terminal<CjkSafeBackend<Stdout>>,
         lines: Vec<Line<'static>>,
     ) -> io::Result<()> {
         if lines.is_empty() {
@@ -375,7 +551,7 @@ impl Workbench {
 
     fn push_notice(
         &self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut Terminal<CjkSafeBackend<Stdout>>,
         color: Color,
         text: impl AsRef<str>,
     ) -> io::Result<()> {
@@ -392,7 +568,7 @@ impl Workbench {
 
     fn print_banner(
         &self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut Terminal<CjkSafeBackend<Stdout>>,
         resumed: bool,
     ) -> io::Result<()> {
         let agent_name = self
@@ -433,10 +609,7 @@ impl Workbench {
         self.push_lines(terminal, vec![header, tips, Line::default()])
     }
 
-    fn replay_active_wal(
-        &self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    ) -> io::Result<()> {
+    fn replay_active_wal(&self, terminal: &mut Terminal<CjkSafeBackend<Stdout>>) -> io::Result<()> {
         let turns = load_recent_replay(&self.meta.active_wal, self.meta.active_leaf, 8);
         if turns.is_empty() {
             return Ok(());
@@ -516,7 +689,7 @@ impl Workbench {
 
     fn spawn_main_worker(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut Terminal<CjkSafeBackend<Stdout>>,
     ) -> io::Result<()> {
         if let Some(mut old) = self.workers.remove("main") {
             old.handle.stop(libc::SIGTERM);
@@ -551,7 +724,7 @@ impl Workbench {
 
     fn respawn_worker(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut Terminal<CjkSafeBackend<Stdout>>,
         worker_id: &str,
         new_wal: Option<PathBuf>,
         new_leaf: Option<Option<u64>>,
@@ -611,7 +784,7 @@ impl Workbench {
         }
     }
 
-    fn on_tick(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
+    fn on_tick(&mut self, terminal: &mut Terminal<CjkSafeBackend<Stdout>>) -> io::Result<()> {
         self.spinner_idx = (self.spinner_idx + 1) % SPINNER_FRAMES.len();
         let mut exited = Vec::new();
         for (id, st) in &mut self.workers {
@@ -660,7 +833,7 @@ impl Workbench {
 
     fn handle_incoming_approval(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut Terminal<CjkSafeBackend<Stdout>>,
         pending: PendingApproval,
     ) -> io::Result<()> {
         if let Some(decision) = try_auto_decide(self.policy, &self.always_allowed, &pending.cmd) {
@@ -687,7 +860,7 @@ impl Workbench {
 
     fn handle_worker_event(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut Terminal<CjkSafeBackend<Stdout>>,
         ev: WorkerEvent,
     ) -> io::Result<()> {
         let width = self.term_width(terminal);
@@ -980,7 +1153,7 @@ impl Workbench {
 
     fn flush_focused_buffers(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut Terminal<CjkSafeBackend<Stdout>>,
         add_trailing_blank: bool,
     ) -> io::Result<()> {
         let width = self.term_width(terminal);
@@ -1043,7 +1216,7 @@ impl Workbench {
 
     fn print_tool_card(
         &self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut Terminal<CjkSafeBackend<Stdout>>,
         tool: &ToolRunState,
         width: usize,
     ) -> io::Result<()> {
@@ -1112,7 +1285,7 @@ impl Workbench {
 
     fn handle_key(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut Terminal<CjkSafeBackend<Stdout>>,
         key: KeyEvent,
     ) -> io::Result<()> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -1244,7 +1417,7 @@ impl Workbench {
 
     fn handle_approval_key(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut Terminal<CjkSafeBackend<Stdout>>,
         key: KeyEvent,
     ) -> io::Result<()> {
         let Some(mut active) = self.active_approval.take() else {
@@ -1372,7 +1545,7 @@ impl Workbench {
 
     fn handle_overlay_key(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut Terminal<CjkSafeBackend<Stdout>>,
         key: KeyEvent,
     ) -> io::Result<()> {
         let overlay = std::mem::replace(&mut self.overlay, Overlay::None);
@@ -1536,7 +1709,7 @@ impl Workbench {
 
     fn switch_session(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut Terminal<CjkSafeBackend<Stdout>>,
         new_dir: PathBuf,
         new_meta: SessionMeta,
     ) -> io::Result<()> {
@@ -1559,7 +1732,7 @@ impl Workbench {
 
     fn submit_user_input(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut Terminal<CjkSafeBackend<Stdout>>,
         text: String,
     ) -> io::Result<()> {
         if text.starts_with('/') {
@@ -1614,7 +1787,7 @@ impl Workbench {
 
     fn handle_slash_command(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut Terminal<CjkSafeBackend<Stdout>>,
         raw: &str,
     ) -> io::Result<()> {
         let mut parts = raw.split_whitespace();
@@ -1893,7 +2066,7 @@ Keys:
 
     fn fork_focused_wal(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut Terminal<CjkSafeBackend<Stdout>>,
         name: Option<&str>,
         leaf: Option<u64>,
     ) -> io::Result<()> {
@@ -1939,7 +2112,7 @@ Keys:
 
     fn cmd_spawn_worker(
         &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut Terminal<CjkSafeBackend<Stdout>>,
         rest: &str,
     ) -> io::Result<()> {
         let tokens: Vec<&str> = rest.split_whitespace().collect();
@@ -2073,7 +2246,7 @@ Keys:
 
     fn print_wal_node_inspect(
         &self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        terminal: &mut Terminal<CjkSafeBackend<Stdout>>,
         row: &crate::wal_view::WalNodeRow,
     ) -> io::Result<()> {
         let width = self.term_width(terminal);
@@ -2799,4 +2972,40 @@ fn truncate_single_line(raw: &str, max_cols: usize) -> String {
         w += cw;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::buffer::Buffer;
+
+    #[test]
+    fn cjk_safe_backend_skips_wide_char_trailing_cells_in_insert_before() {
+        let sample = "这个项目：Anix — POSIX 原生 Agent 内核";
+        let width: u16 = 60;
+        let area = Rect::new(0, 0, width, 1);
+        let mut buf = Buffer::empty(area);
+        Paragraph::new(Line::from(sample)).render(area, &mut buf);
+
+        // Simulate `ratatui 0.29`'s `Terminal::draw_lines` (which yields EVERY raw buffer cell).
+        let mut backend = CjkSafeBackend::new(Vec::<u8>::new());
+        let w = width as usize;
+        let iter = buf
+            .content
+            .iter()
+            .enumerate()
+            .map(|(i, c)| ((i % w) as u16, (i / w) as u16, c));
+        backend.draw(iter).unwrap();
+        backend.flush().unwrap();
+
+        let rendered = String::from_utf8(backend.writer).unwrap();
+        assert!(
+            rendered.contains(sample),
+            "expected contiguous CJK output without phantom spaces, got: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("这 个"),
+            "must NOT insert phantom space between CJK chars: {rendered:?}"
+        );
+    }
 }
