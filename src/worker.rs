@@ -60,6 +60,10 @@ pub enum WorkerEvent {
         cycle_id: u64,
         source: String,
     },
+    InboxSteered {
+        worker_id: String,
+        count: u64,
+    },
     ReasoningDelta {
         worker_id: String,
         text: String,
@@ -523,6 +527,10 @@ fn parse_trace_line(worker_id: &str, line: &str) -> Option<WorkerEvent> {
             worker_id: wid,
             cycle_id: f.get("cycle_id").and_then(Value::as_u64).unwrap_or(0),
             source: str_field(f.get("source")),
+        }),
+        "inbox_steered" => Some(WorkerEvent::InboxSteered {
+            worker_id: wid,
+            count: f.get("count").and_then(Value::as_u64).unwrap_or(1),
         }),
         "reasoning_delta" => Some(WorkerEvent::ReasoningDelta {
             worker_id: wid,

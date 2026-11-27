@@ -77,9 +77,9 @@ pub struct Cli {
     #[arg(long = "shell")]
     pub shell: Option<String>,
 
-    /// Initial approval policy (`ask`, `auto`, or `plan`). Toggle live with `Shift+Tab`.
-    #[arg(long = "mode", value_enum, default_value_t = ApprovalPolicy::Ask)]
-    pub mode: ApprovalPolicy,
+    /// Initial approval policy (`ask`, `auto`, or `plan`). Defaults to `~/.config/anix-agent/config.json`.
+    #[arg(long = "mode", value_enum)]
+    pub mode: Option<ApprovalPolicy>,
 
     /// Explicit path to the Layer 1 `anix` executable (defaults to `$ANIX_BIN` / `$PATH` / `~/.local/bin/anix`).
     #[arg(long = "anix-bin", value_name = "PATH")]

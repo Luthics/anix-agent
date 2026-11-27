@@ -42,6 +42,189 @@ pub struct ReplayTurn {
     pub text: String,
 }
 
+/// Conversation rewind checkpoint corresponding to a user prompt along the active WAL lineage.
+#[derive(Debug, Clone)]
+pub struct RewindPoint {
+    pub user_node_id: u64,
+    /// Leaf node right before this user prompt (restoring here lets the user edit & resend it).
+    pub before_leaf: Option<u64>,
+    /// Final safe leaf node of this prompt's turn (restoring here keeps this turn & drops later ones).
+    pub after_leaf: u64,
+    pub ts: String,
+    pub prompt_text: String,
+    pub preview: String,
+    pub reply_preview: Option<String>,
+}
+
+/// Estimated token usage broken down by category along the active WAL lineage (for `/context`).
+#[derive(Debug, Clone, Default)]
+pub struct ContextBreakdown {
+    pub max_tokens: u64,
+    pub total_tokens: u64,
+    pub system_tokens: u64,
+    pub user_tokens: u64,
+    pub assistant_tokens: u64,
+    pub tool_tokens: u64,
+    pub fold_tokens: u64,
+    pub message_count: usize,
+    pub tool_count: usize,
+    pub fold_count: usize,
+}
+
+/// Analyze token distribution along the active lineage of `wal_path` (strictly read-only,
+/// crossing `branch_base` files cleanly) and align total to `reported_tokens` when available.
+pub fn analyze_wal_context(
+    wal_path: &Path,
+    active_leaf: Option<u64>,
+    max_tokens: u64,
+    reported_tokens: Option<u64>,
+) -> ContextBreakdown {
+    let mut visited = HashSet::new();
+    let events = collect_lineage_events(wal_path, active_leaf, &mut visited);
+
+    let mut sys_est = 0u64;
+    let mut usr_est = 0u64;
+    let mut asst_est = 0u64;
+    let mut tool_est = 0u64;
+    let mut fold_est = 0u64;
+    let mut message_count = 0usize;
+    let mut tool_count = 0usize;
+    let mut fold_count = 0usize;
+
+    for ev in &events {
+        match ev {
+            WalEvent::Message {
+                role,
+                text,
+                reasoning,
+                tool_calls,
+                ..
+            } => {
+                let mut chars = text.as_deref().map(str::len).unwrap_or(0)
+                    + reasoning.as_deref().map(str::len).unwrap_or(0);
+                for tc in tool_calls {
+                    chars += tc.name.len() + tc.arguments.to_string().len();
+                }
+                let est = ((chars as u64) / 3).max(4);
+                match role {
+                    WalRole::System => sys_est += est,
+                    WalRole::User => {
+                        usr_est += est;
+                        message_count += 1;
+                    }
+                    WalRole::Assistant => {
+                        asst_est += est;
+                        message_count += 1;
+                    }
+                    WalRole::Tool => {
+                        tool_est += est;
+                        tool_count += 1;
+                    }
+                }
+            }
+            WalEvent::RuntimeUpdate { content, .. } => {
+                sys_est += ((content.len() as u64) / 3).max(4);
+            }
+            WalEvent::Fold { summary, .. } => {
+                fold_est += ((summary.len() as u64) / 3).max(4);
+                fold_count += 1;
+            }
+            _ => {}
+        }
+    }
+
+    let raw_sum = sys_est + usr_est + asst_est + tool_est + fold_est;
+    let total_tokens = reported_tokens.unwrap_or(raw_sum);
+
+    // Proportionally calibrate per-category estimates to match kernel's authoritative `reported_tokens`.
+    let (system_tokens, user_tokens, assistant_tokens, tool_tokens, fold_tokens) =
+        if raw_sum > 0 && total_tokens > 0 && reported_tokens.is_some() {
+            let scale = |v: u64| ((v as u128 * total_tokens as u128) / raw_sum as u128) as u64;
+            let s = scale(sys_est);
+            let u = scale(usr_est);
+            let a = scale(asst_est);
+            let t = scale(tool_est);
+            let f = total_tokens.saturating_sub(s + u + a + t);
+            (s, u, a, t, f)
+        } else {
+            (sys_est, usr_est, asst_est, tool_est, fold_est)
+        };
+
+    ContextBreakdown {
+        max_tokens: max_tokens.max(1),
+        total_tokens,
+        system_tokens,
+        user_tokens,
+        assistant_tokens,
+        tool_tokens,
+        fold_tokens,
+        message_count,
+        tool_count,
+        fold_count,
+    }
+}
+
+fn collect_lineage_events(
+    wal_path: &Path,
+    requested_leaf: Option<u64>,
+    visited: &mut HashSet<(PathBuf, u64)>,
+) -> Vec<WalEvent> {
+    let Ok(events) = read_wal_events(wal_path) else {
+        return Vec::new();
+    };
+    if events.is_empty() {
+        return Vec::new();
+    }
+    let is_tree = events.last().and_then(WalEvent::id).is_some();
+    if !is_tree {
+        return events;
+    }
+    let eof_id = events.last().and_then(WalEvent::id).unwrap_or(0);
+    let target = requested_leaf.unwrap_or(eof_id);
+    if target == 0 {
+        return Vec::new();
+    }
+    let canon = fs::canonicalize(wal_path).unwrap_or_else(|_| wal_path.to_path_buf());
+    if !visited.insert((canon, target)) {
+        return Vec::new();
+    }
+
+    let mut want = Some(target);
+    let mut rev_events = Vec::new();
+    let mut parent_events = Vec::new();
+    for ev in events.into_iter().rev() {
+        let Some(id) = ev.id() else { continue };
+        if Some(id) != want {
+            continue;
+        }
+        match &ev {
+            WalEvent::SessionInit { .. } | WalEvent::Checkpoint { .. } => {
+                rev_events.push(ev);
+                break;
+            }
+            WalEvent::BranchBase { base, .. } => {
+                if let Some((parent_path_s, leaf_s)) = base.rsplit_once('#')
+                    && let Ok(parent_leaf) = leaf_s.parse::<u64>()
+                {
+                    parent_events = collect_lineage_events(
+                        Path::new(parent_path_s),
+                        Some(parent_leaf),
+                        visited,
+                    );
+                }
+                break;
+            }
+            _ => {
+                want = ev.parent_id();
+                rev_events.push(ev);
+            }
+        }
+    }
+    rev_events.reverse();
+    parent_events.extend(rev_events);
+    parent_events
+}
+
 impl WalGraph {
     /// Load and build the interactive tree graph for `wal_path` (strictly read-only, no `flock`).
     pub fn load(wal_path: &Path, active_leaf: Option<u64>) -> io::Result<Self> {
@@ -143,6 +326,50 @@ impl WalGraph {
     pub fn find_node(&self, node_id: u64) -> Option<&WalNodeRow> {
         self.rows.iter().find(|r| r.id == node_id)
     }
+
+    /// Build chronological rewind checkpoints (each user prompt along the active lineage) for `/rewind`.
+    pub fn rewind_points(&self) -> Vec<RewindPoint> {
+        let lineage: Vec<&WalNodeRow> = self.rows.iter().filter(|r| r.on_active_lineage).collect();
+        let mut points = Vec::new();
+        for (idx, row) in lineage.iter().enumerate() {
+            if row.kind != "user" {
+                continue;
+            }
+            // Walk forward until the next user turn on this lineage to find the turn's end leaf
+            // and a brief assistant reply preview.
+            let mut after_leaf = row.id;
+            let mut reply_preview = None;
+            for next in &lineage[idx + 1..] {
+                if next.kind == "user" {
+                    break;
+                }
+                if next.selectable_leaf {
+                    after_leaf = next.id;
+                }
+                if next.kind == "assistant" && !next.preview.is_empty() {
+                    reply_preview = Some(next.preview.clone());
+                }
+            }
+            // Validate parent as a safe `--leaf` (System / Assistant / Tool / Fold / BranchBase are valid;
+            // SessionInit / Checkpoint are not).
+            let before_leaf = row.parent_id.filter(|&pid| {
+                self.find_node(pid)
+                    .is_some_and(|p| !matches!(p.kind.as_str(), "init" | "checkpoint"))
+            });
+            let clean_prompt = unwrap_maildir_input(&row.full_text);
+            let preview = truncate_one_line(&clean_prompt, 72);
+            points.push(RewindPoint {
+                user_node_id: row.id,
+                before_leaf,
+                after_leaf,
+                ts: row.ts.clone(),
+                prompt_text: clean_prompt,
+                preview,
+                reply_preview,
+            });
+        }
+        points
+    }
 }
 
 /// Extract recent human-readable `(role, text)` turns along the active lineage (crossing
@@ -234,7 +461,8 @@ fn wal_event_to_replay_turn(ev: &WalEvent) -> Option<ReplayTurn> {
             text,
             ..
         } => {
-            let t = text.as_deref().unwrap_or("").trim();
+            let clean = unwrap_maildir_input(text.as_deref().unwrap_or(""));
+            let t = clean.trim();
             if t.is_empty() {
                 None
             } else {
@@ -477,6 +705,8 @@ fn summarize_event(ev: &WalEvent) -> EventSummary {
                 s
             } else if let Some(cid) = tool_call_id {
                 format!("[{cid}]\n{}", text.as_deref().unwrap_or(""))
+            } else if matches!(role, WalRole::User) {
+                unwrap_maildir_input(text.as_deref().unwrap_or(""))
             } else {
                 text.clone().unwrap_or_default()
             };
@@ -515,6 +745,37 @@ fn short_ts(ts: &str) -> String {
         time_part.chars().take(8).collect()
     } else {
         ts.chars().take(8).collect()
+    }
+}
+
+/// Strip `<input ...>...</input>` Maildir envelope wrappers so UI views (`/rewind`, `/tree`,
+/// `/resume` replay) display clean user prompt text.
+pub fn unwrap_maildir_input(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("<input ") || !trimmed.ends_with("</input>") {
+        return trimmed.to_owned();
+    }
+    let mut parts = Vec::new();
+    let mut rest = trimmed;
+    while let Some(start) = rest.find("<input ") {
+        let after_start = &rest[start..];
+        let Some(gt) = after_start.find('>') else {
+            break;
+        };
+        let body_and_tail = &after_start[gt + 1..];
+        let Some(close) = body_and_tail.find("</input>") else {
+            break;
+        };
+        let inner = body_and_tail[..close].trim();
+        if !inner.is_empty() {
+            parts.push(inner);
+        }
+        rest = &body_and_tail[close + "</input>".len()..];
+    }
+    if parts.is_empty() {
+        trimmed.to_owned()
+    } else {
+        parts.join("\n\n")
     }
 }
 
@@ -633,6 +894,16 @@ mod tests {
         assert_eq!(replay.len(), 2);
         assert_eq!(replay[0].text, "first");
         assert_eq!(replay[1].text, "branch B");
+
+        let rps = graph.rewind_points();
+        assert_eq!(rps.len(), 1);
+        assert_eq!(rps[0].user_node_id, 3);
+        assert_eq!(rps[0].before_leaf, Some(2));
+        assert_eq!(rps[0].after_leaf, 5);
+        assert_eq!(
+            unwrap_maildir_input("<input source=\"a.msg\" from=\"user\">\nhello world\n</input>"),
+            "hello world"
+        );
 
         let _ = fs::remove_file(&tmp);
     }

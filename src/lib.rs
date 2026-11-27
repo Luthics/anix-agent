@@ -3,8 +3,10 @@
 pub mod app;
 pub mod approve;
 pub mod cli;
+pub mod config;
 pub mod input;
 pub mod markdown;
 pub mod session;
+pub mod statusbar;
 pub mod wal_view;
 pub mod worker;

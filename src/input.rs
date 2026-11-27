@@ -34,6 +34,18 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         execute_on_enter: true,
     },
     SlashCommandSpec {
+        name: "/config",
+        args_hint: "[key] [value]",
+        description: "Interactive settings panel & ~/.config/anix-agent/config.json",
+        execute_on_enter: true,
+    },
+    SlashCommandSpec {
+        name: "/context",
+        args_hint: "",
+        description: "Visualize context token usage grid by category",
+        execute_on_enter: true,
+    },
+    SlashCommandSpec {
         name: "/fork",
         args_hint: "[name]",
         description: "Fork active WAL into an independent branch",
@@ -76,6 +88,18 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         execute_on_enter: true,
     },
     SlashCommandSpec {
+        name: "/resume",
+        args_hint: "[session_id]",
+        description: "Search, rename, delete, or resume saved conversations",
+        execute_on_enter: true,
+    },
+    SlashCommandSpec {
+        name: "/rewind",
+        args_hint: "",
+        description: "Rewind conversation to a prior user prompt (Esc ×2)",
+        execute_on_enter: true,
+    },
+    SlashCommandSpec {
         name: "/send",
         args_hint: "<worker> <msg>",
         description: "Send a Maildir message to a running worker",
@@ -84,7 +108,7 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "/sessions",
         args_hint: "",
-        description: "Browse and switch saved project sessions",
+        description: "Alias for /resume (open conversation picker)",
         execute_on_enter: true,
     },
     SlashCommandSpec {
@@ -92,6 +116,12 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         args_hint: "<agent> [prompt]",
         description: "Spawn a parallel worker with --notify callback",
         execute_on_enter: false,
+    },
+    SlashCommandSpec {
+        name: "/statusbar",
+        args_hint: "[vars|preset|<tpl>]",
+        description: "Customize DIY variable-based status bar live",
+        execute_on_enter: true,
     },
     SlashCommandSpec {
         name: "/tree",
@@ -107,12 +137,17 @@ pub const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     },
 ];
 
-/// Dynamic runtime context passed into live completion (cwd, discovered agents, active workers).
+use crate::session::CustomSlashEntry;
+
+/// Dynamic runtime context passed into live completion (cwd, discovered agents, active workers,
+/// saved sessions, and custom commands/skills).
 #[derive(Debug, Clone, Copy)]
 pub struct CompletionContext<'a> {
     pub cwd: &'a Path,
     pub agents: &'a [String],
     pub workers: &'a [String],
+    pub sessions: &'a [(String, String)],
+    pub custom_commands: &'a [CustomSlashEntry],
 }
 
 /// Single candidate row displayed in the live inline completion dropdown.
@@ -311,6 +346,13 @@ impl InputBox {
                 edited = true;
                 InputAction::None
             }
+            KeyCode::Enter if self.char_before_cursor() == Some('\\') => {
+                // `\` + Enter newline (universal across macOS/Linux/SSH terminals!)
+                self.delete_char_before();
+                self.insert_char('\n');
+                edited = true;
+                InputAction::None
+            }
             KeyCode::Char('j') if ctrl => {
                 self.insert_char('\n');
                 edited = true;
@@ -504,6 +546,13 @@ impl InputBox {
 
     fn char_len(&self) -> usize {
         self.text.chars().count()
+    }
+
+    fn char_before_cursor(&self) -> Option<char> {
+        if self.cursor_char == 0 {
+            return None;
+        }
+        self.text.chars().nth(self.cursor_char - 1)
     }
 
     fn byte_index_of(&self, char_idx: usize) -> usize {
@@ -734,6 +783,31 @@ fn compute_completion(
                 fuzzy_hits.push(item);
             }
         }
+        for custom in ctx.custom_commands {
+            // Skip if a built-in command already owns this exact name.
+            if SLASH_COMMAND_SPECS
+                .iter()
+                .any(|s| s.name.eq_ignore_ascii_case(&custom.slash_name))
+            {
+                continue;
+            }
+            let name_lower = custom.slash_name.to_ascii_lowercase();
+            let bare = name_lower.strip_prefix('/').unwrap_or(&name_lower);
+            let item = CompletionItem {
+                label: custom.slash_name.clone(),
+                insert: custom.slash_name.clone(),
+                description: custom.description.clone(),
+                execute_on_enter: true,
+                append_space: true,
+            };
+            if needle.is_empty() || bare.starts_with(needle) {
+                prefix_hits.push(item);
+            } else if bare.contains(needle) {
+                contains_hits.push(item);
+            } else if is_fuzzy_subsequence(needle, bare) {
+                fuzzy_hits.push(item);
+            }
+        }
         prefix_hits.extend(contains_hits);
         prefix_hits.extend(fuzzy_hits);
         if prefix_hits.is_empty() {
@@ -748,15 +822,16 @@ fn compute_completion(
         });
     }
 
-    // 3. Second token: contextual sub-completions for `/mode`, `/agent`, `/spawn`, `/send`.
+    // 3. Contextual sub-completions for `/mode`, `/agent`, `/spawn`, `/send`, `/resume`, `/config`.
     let before_token = prefix[..token_start].trim();
-    let mut parts = before_token.split_whitespace();
-    let cmd = parts.next()?;
-    let extra_arg_count = parts.count();
+    let tokens_before: Vec<&str> = before_token.split_whitespace().collect();
+    let cmd = *tokens_before.first()?;
+    let second_arg = tokens_before.get(1).copied();
+    let extra_arg_count = tokens_before.len().saturating_sub(1);
     let q = token.to_ascii_lowercase();
 
-    let items: Vec<CompletionItem> = match (cmd, extra_arg_count) {
-        ("/mode", 0) => [
+    let items: Vec<CompletionItem> = match (cmd, extra_arg_count, second_arg) {
+        ("/mode", 0, _) => [
             ("ask", "Auto-allow safe reads; prompt inline for writes"),
             ("auto", "Automatically approve all shell commands"),
             ("plan", "Read-only planning mode; block mutating commands"),
@@ -771,7 +846,142 @@ fn compute_completion(
             append_space: false,
         })
         .collect(),
-        ("/agent", 0) => ctx
+        ("/config", 0, _) => [
+            (
+                "bang_mode",
+                "Behavior after `!cmd`: silent | attach | trigger",
+            ),
+            ("default_mode", "Default approval mode: ask | auto | plan"),
+            (
+                "auto_resume_last",
+                "Auto-resume latest cwd session on boot: true | false",
+            ),
+            (
+                "expand_details",
+                "Expand thinking & tool output by default: true | false",
+            ),
+            ("replay_turns", "Turns replayed on /resume (default 8)"),
+            ("bang_shell", "Shell used for `!cmd` (default $SHELL)"),
+            (
+                "status_bar",
+                "DIY variable template (default | minimal | full | custom)",
+            ),
+        ]
+        .into_iter()
+        .filter(|(k, _)| k.starts_with(&q))
+        .map(|(k, desc)| CompletionItem {
+            label: k.to_owned(),
+            insert: k.to_owned(),
+            description: desc.to_owned(),
+            execute_on_enter: false,
+            append_space: true,
+        })
+        .collect(),
+        ("/config", 1, Some("bang_mode")) => [
+            ("silent", "Run `!cmd` locally only; do NOT trigger model"),
+            (
+                "attach",
+                "Run locally; attach output to your next prompt without waking model",
+            ),
+            (
+                "trigger",
+                "Run locally and immediately wake model with command output",
+            ),
+        ]
+        .into_iter()
+        .filter(|(v, _)| v.starts_with(&q))
+        .map(|(v, desc)| CompletionItem {
+            label: v.to_owned(),
+            insert: v.to_owned(),
+            description: desc.to_owned(),
+            execute_on_enter: true,
+            append_space: false,
+        })
+        .collect(),
+        ("/config", 1, Some("default_mode")) => [
+            ("ask", "Auto-allow safe reads; prompt inline for writes"),
+            ("auto", "Automatically approve all shell commands"),
+            ("plan", "Read-only planning mode; block mutating commands"),
+        ]
+        .into_iter()
+        .filter(|(v, _)| v.starts_with(&q))
+        .map(|(v, desc)| CompletionItem {
+            label: v.to_owned(),
+            insert: v.to_owned(),
+            description: desc.to_owned(),
+            execute_on_enter: true,
+            append_space: false,
+        })
+        .collect(),
+        ("/config", 1, Some("auto_resume_last" | "expand_details")) => {
+            [("true", "Enable setting"), ("false", "Disable setting")]
+                .into_iter()
+                .filter(|(v, _)| v.starts_with(&q))
+                .map(|(v, desc)| CompletionItem {
+                    label: v.to_owned(),
+                    insert: v.to_owned(),
+                    description: desc.to_owned(),
+                    execute_on_enter: true,
+                    append_space: false,
+                })
+                .collect()
+        }
+        ("/config", 1, Some("status_bar")) => [
+            ("default", "Clean mode + model + git + ctx + hints"),
+            ("minimal", "Ultra-compact mode + model + ctx_pct"),
+            (
+                "full",
+                "Full telemetry bar (worker, dir, git, ctx, tokens, bang)",
+            ),
+        ]
+        .into_iter()
+        .filter(|(v, _)| v.starts_with(&q))
+        .map(|(v, desc)| CompletionItem {
+            label: v.to_owned(),
+            insert: v.to_owned(),
+            description: desc.to_owned(),
+            execute_on_enter: true,
+            append_space: false,
+        })
+        .collect(),
+        ("/statusbar", 0, _) => [
+            ("vars", "List all {variables} with their live values"),
+            ("preset", "Switch preset: default | minimal | full"),
+            (
+                "edit",
+                "Pre-fill current status_bar template into input to edit live",
+            ),
+            ("reset", "Restore default status bar template"),
+        ]
+        .into_iter()
+        .filter(|(v, _)| v.starts_with(&q))
+        .map(|(v, desc)| CompletionItem {
+            label: v.to_owned(),
+            insert: v.to_owned(),
+            description: desc.to_owned(),
+            execute_on_enter: v != "preset",
+            append_space: v == "preset",
+        })
+        .collect(),
+        ("/statusbar", 1, Some("preset")) => [
+            ("default", "Clean mode + model + git + ctx + hints"),
+            ("minimal", "Ultra-compact mode + model + ctx_pct"),
+            (
+                "full",
+                "Full telemetry bar (worker, dir, git, ctx, tokens, bang)",
+            ),
+        ]
+        .into_iter()
+        .filter(|(v, _)| v.starts_with(&q))
+        .map(|(v, desc)| CompletionItem {
+            label: v.to_owned(),
+            insert: v.to_owned(),
+            description: desc.to_owned(),
+            execute_on_enter: true,
+            append_space: false,
+        })
+        .collect(),
+        ("/agent", 0, _) => ctx
             .agents
             .iter()
             .filter(|a| a.to_ascii_lowercase().starts_with(&q))
@@ -783,7 +993,7 @@ fn compute_completion(
                 append_space: false,
             })
             .collect(),
-        ("/spawn", 0) => ctx
+        ("/spawn", 0, _) => ctx
             .agents
             .iter()
             .filter(|a| a.to_ascii_lowercase().starts_with(&q))
@@ -795,7 +1005,7 @@ fn compute_completion(
                 append_space: true,
             })
             .collect(),
-        ("/send", 0) => ctx
+        ("/send", 0, _) => ctx
             .workers
             .iter()
             .filter(|w| w.to_ascii_lowercase().starts_with(&q))
@@ -805,6 +1015,20 @@ fn compute_completion(
                 description: format!("Deliver Maildir message to worker `{w}`"),
                 execute_on_enter: false,
                 append_space: true,
+            })
+            .collect(),
+        ("/resume", 0, _) => ctx
+            .sessions
+            .iter()
+            .filter(|(id, title)| {
+                id.to_ascii_lowercase().contains(&q) || title.to_ascii_lowercase().contains(&q)
+            })
+            .map(|(id, title)| CompletionItem {
+                label: id.clone(),
+                insert: id.clone(),
+                description: title.clone(),
+                execute_on_enter: true,
+                append_space: false,
             })
             .collect(),
         _ => Vec::new(),
@@ -888,6 +1112,8 @@ mod tests {
             cwd,
             agents: &[],
             workers: &[],
+            sessions: &[],
+            custom_commands: &[],
         }
     }
 

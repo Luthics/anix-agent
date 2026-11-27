@@ -47,12 +47,32 @@ pub struct SessionMeta {
     pub approval_policy: ApprovalPolicy,
 }
 
-/// Summary row shown in `/sessions`.
+/// Discovered custom slash command (`commands/*.md`) or skill (`skills/*/SKILL.md`) surfaced in `/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CustomSlashKind {
+    Command(PathBuf),
+    Skill(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomSlashEntry {
+    /// Slash command name including leading `/` (e.g. `/review-pr` or `/playwright-cli`).
+    pub slash_name: String,
+    pub description: String,
+    /// Origin badge shown in completion menu (`user`, `project`, or `skill`).
+    pub source_tag: &'static str,
+    pub kind: CustomSlashKind,
+}
+
+/// Summary row shown in `/resume` and `/sessions`.
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub meta: SessionMeta,
     pub session_dir: PathBuf,
     pub wal_bytes: u64,
+    pub turn_count: usize,
+    pub project_label: String,
+    pub is_current_project: bool,
 }
 
 /// Manages `${XDG_DATA_HOME:-~/.local/share}/anix-agent/` paths and session directories.
@@ -184,6 +204,40 @@ impl SessionStore {
         out
     }
 
+    /// Discover custom markdown commands (`~/.config/anix/commands/*.md`, `<cwd>/.anix/commands/*.md`)
+    /// and skills (`~/.config/anix/skills/*/SKILL.md`, `~/.agents/skills/*/SKILL.md`) for live `/` completion.
+    pub fn discover_custom_slash_entries(&self) -> Vec<CustomSlashEntry> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+
+        let config_anix = self
+            .config_agents_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.home_dir.join(".config/anix"));
+
+        // 1. Project commands (`<cwd>/.anix/commands/*.md`) take highest priority.
+        scan_markdown_commands(
+            &self.cwd.join(".anix/commands"),
+            "project",
+            &mut seen,
+            &mut out,
+        );
+        // 2. User commands (`~/.config/anix/commands/*.md`).
+        scan_markdown_commands(&config_anix.join("commands"), "user", &mut seen, &mut out);
+        // 3. Skills (`~/.config/anix/skills/*/SKILL.md`, `~/.agents/skills/*/SKILL.md`).
+        scan_skill_dirs(&config_anix.join("skills"), "skill", &mut seen, &mut out);
+        scan_skill_dirs(
+            &self.home_dir.join(".agents/skills"),
+            "skill",
+            &mut seen,
+            &mut out,
+        );
+
+        out.sort_by(|a, b| a.slash_name.cmp(&b.slash_name));
+        out
+    }
+
     /// Create a brand-new persistent session directory (`main.wal.jsonl`, `branches/`, `inbox/`, `meta.json`).
     pub fn create_session(
         &self,
@@ -219,41 +273,59 @@ impl SessionStore {
 
     /// List all sessions for the current working directory, newest first.
     pub fn list_sessions(&self) -> Vec<SessionSummary> {
-        let root = self.project_sessions_dir();
-        let Ok(entries) = fs::read_dir(&root) else {
+        let mut list = read_sessions_in_dir(&self.project_sessions_dir(), true);
+        list.sort_by(|a, b| b.meta.updated_at.cmp(&a.meta.updated_at));
+        list
+    }
+
+    /// List all sessions across every project under `${XDG_DATA_HOME}/anix-agent/sessions/`, newest first.
+    pub fn list_all_sessions(&self) -> Vec<SessionSummary> {
+        let sessions_root = self.data_dir.join("sessions");
+        let Ok(project_dirs) = fs::read_dir(&sessions_root) else {
             return Vec::new();
         };
         let mut list = Vec::new();
-        for entry in entries.flatten() {
-            let dir = entry.path();
-            if !dir.is_dir() {
+        for entry in project_dirs.flatten() {
+            let pdir = entry.path();
+            if !pdir.is_dir() {
                 continue;
             }
-            let meta_path = dir.join("meta.json");
-            let Ok(raw) = fs::read_to_string(&meta_path) else {
-                continue;
-            };
-            let Ok(meta) = serde_json::from_str::<SessionMeta>(&raw) else {
-                continue;
-            };
-            let wal_bytes = fs::metadata(&meta.active_wal).map(|m| m.len()).unwrap_or(0);
-            list.push(SessionSummary {
-                meta,
-                session_dir: dir,
-                wal_bytes,
-            });
+            let is_cur = pdir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n == self.project_slug);
+            list.extend(read_sessions_in_dir(&pdir, is_cur));
         }
         list.sort_by(|a, b| b.meta.updated_at.cmp(&a.meta.updated_at));
         list
     }
 
-    /// Find a session by `"latest"` or exact/prefix ID match.
+    /// Delete a saved session directory safely (verifying it lives under `data_dir/sessions/`).
+    pub fn delete_session(&self, session_dir: &Path) -> io::Result<()> {
+        let root = fs::canonicalize(self.data_dir.join("sessions"))?;
+        let target = fs::canonicalize(session_dir)?;
+        if !target.starts_with(&root) || target == root {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "refusing to delete path outside sessions directory",
+            ));
+        }
+        fs::remove_dir_all(&target)
+    }
+
+    /// Find a session by `"latest"` or exact/prefix ID match (checks current project first, then all).
     pub fn find_session(&self, query: &str) -> Option<(PathBuf, SessionMeta)> {
         let sessions = self.list_sessions();
         if query == "latest" {
             return sessions.into_iter().next().map(|s| (s.session_dir, s.meta));
         }
-        sessions
+        if let Some(hit) = sessions
+            .into_iter()
+            .find(|s| s.meta.id == query || s.meta.id.starts_with(query))
+        {
+            return Some((hit.session_dir, hit.meta));
+        }
+        self.list_all_sessions()
             .into_iter()
             .find(|s| s.meta.id == query || s.meta.id.starts_with(query))
             .map(|s| (s.session_dir, s.meta))
@@ -347,6 +419,187 @@ pub fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into())
+}
+
+/// Format an RFC 3339 UTC timestamp (`YYYY-MM-DDTHH:MM:SS...Z`) into a crisp relative label
+/// (`just now`, `5m ago`, `3h ago`, `2d ago`).
+pub fn format_relative_time(rfc3339: &str) -> String {
+    let Some(ts_secs) = parse_rfc3339_utc_secs(rfc3339) else {
+        return rfc3339.chars().take(10).collect();
+    };
+    let now_secs = OffsetDateTime::now_utc().unix_timestamp();
+    let diff = now_secs.saturating_sub(ts_secs);
+    if diff < 60 {
+        "just now".into()
+    } else if diff < 3600 {
+        format!("{}m ago", diff / 60)
+    } else if diff < 86_400 {
+        format!("{}h ago", diff / 3600)
+    } else if diff < 86_400 * 30 {
+        format!("{}d ago", diff / 86_400)
+    } else {
+        rfc3339.chars().take(10).collect()
+    }
+}
+
+fn parse_rfc3339_utc_secs(s: &str) -> Option<i64> {
+    if s.len() < 19 {
+        return None;
+    }
+    let y: i32 = s.get(0..4)?.parse().ok()?;
+    let mo: u8 = s.get(5..7)?.parse().ok()?;
+    let d: u8 = s.get(8..10)?.parse().ok()?;
+    let h: u8 = s.get(11..13)?.parse().ok()?;
+    let mi: u8 = s.get(14..16)?.parse().ok()?;
+    let sec: u8 = s.get(17..19)?.parse().ok()?;
+    let month = time::Month::try_from(mo).ok()?;
+    let date = time::Date::from_calendar_date(y, month, d).ok()?;
+    let t = time::Time::from_hms(h, mi, sec).ok()?;
+    Some(date.with_time(t).assume_utc().unix_timestamp())
+}
+
+fn read_sessions_in_dir(project_dir: &Path, is_current_project: bool) -> Vec<SessionSummary> {
+    let Ok(entries) = fs::read_dir(project_dir) else {
+        return Vec::new();
+    };
+    let mut list = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let meta_path = dir.join("meta.json");
+        let Ok(raw) = fs::read_to_string(&meta_path) else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_str::<SessionMeta>(&raw) else {
+            continue;
+        };
+        let wal_bytes = fs::metadata(&meta.active_wal).map(|m| m.len()).unwrap_or(0);
+        let turn_count = count_wal_steps(&meta.active_wal);
+        let project_label = meta
+            .cwd
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| meta.cwd.display().to_string());
+        list.push(SessionSummary {
+            meta,
+            session_dir: dir,
+            wal_bytes,
+            turn_count,
+            project_label,
+            is_current_project,
+        });
+    }
+    list
+}
+
+fn count_wal_steps(wal_path: &Path) -> usize {
+    let Ok(raw) = fs::read_to_string(wal_path) else {
+        return 0;
+    };
+    raw.lines()
+        .filter(|l| l.contains("\"type\":\"message\"") && !l.contains("\"role\":\"system\""))
+        .count()
+}
+
+fn scan_markdown_commands(
+    dir: &Path,
+    tag: &'static str,
+    seen: &mut std::collections::HashSet<String>,
+    out: &mut Vec<CustomSlashEntry>,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_file() || p.extension().and_then(|e| e.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let slash_name = format!("/{stem}");
+        if !seen.insert(slash_name.clone()) {
+            continue;
+        }
+        let desc = extract_md_description(&p)
+            .unwrap_or_else(|| format!("Custom command from {}", p.display()));
+        out.push(CustomSlashEntry {
+            slash_name,
+            description: format!("{desc} ({tag})"),
+            source_tag: tag,
+            kind: CustomSlashKind::Command(p),
+        });
+    }
+}
+
+fn scan_skill_dirs(
+    dir: &Path,
+    tag: &'static str,
+    seen: &mut std::collections::HashSet<String>,
+    out: &mut Vec<CustomSlashEntry>,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let sub = entry.path();
+        if !sub.is_dir() {
+            continue;
+        }
+        let skill_md = sub.join("SKILL.md");
+        if !skill_md.is_file() {
+            continue;
+        }
+        let Some(name) = sub.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let slash_name = format!("/{name}");
+        if !seen.insert(slash_name.clone()) {
+            continue;
+        }
+        let desc =
+            extract_md_description(&skill_md).unwrap_or_else(|| format!("Run skill `{name}`"));
+        out.push(CustomSlashEntry {
+            slash_name,
+            description: format!("{desc} ({tag})"),
+            source_tag: tag,
+            kind: CustomSlashKind::Skill(skill_md),
+        });
+    }
+}
+
+fn extract_md_description(path: &Path) -> Option<String> {
+    let raw = fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("---")
+        && let Some((fm, body)) = rest.split_once("\n---")
+    {
+        for line in fm.lines() {
+            let l = line.trim();
+            if let Some(v) = l.strip_prefix("description:") {
+                let clean = v.trim().trim_matches(|c| c == '"' || c == '\'');
+                if !clean.is_empty() {
+                    return Some(clean.chars().take(80).collect());
+                }
+            }
+        }
+        return first_meaningful_line(body);
+    }
+    first_meaningful_line(trimmed)
+}
+
+fn first_meaningful_line(body: &str) -> Option<String> {
+    for line in body.lines() {
+        let clean = line.trim().trim_start_matches('#').trim();
+        if !clean.is_empty() {
+            return Some(clean.chars().take(80).collect());
+        }
+    }
+    None
 }
 
 pub fn ensure_dir_0700(dir: &Path) -> io::Result<()> {
