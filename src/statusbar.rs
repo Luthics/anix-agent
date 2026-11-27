@@ -17,14 +17,17 @@ use unicode_width::UnicodeWidthStr;
 use crate::cli::ApprovalPolicy;
 use crate::config::BangMode;
 
+/// Previous built-in default template (auto-upgraded on load unless customized by user).
+pub const LEGACY_DEFAULT_STATUS_BAR: &str = " {dot} {mode} · {model}{?git_branch  ⎇ {git_branch}} · ctx {ctx_pct}{?leaf  {leaf}}{?holds  ⏳{holds}}{?workers_extra  ⚡{workers}}{right}{hints} ";
+
 /// Default clean Claude-Code-inspired DIY status bar template.
-pub const DEFAULT_STATUS_BAR: &str = " {dot} {mode} · {model}{?git_branch  ⎇ {git_branch}} · ctx {ctx_pct}{?leaf  {leaf}}{?holds  ⏳{holds}}{?workers_extra  ⚡{workers}}{right}{hints} ";
+pub const DEFAULT_STATUS_BAR: &str = " {dot} {mode} · {model}{?effort  ({effort})}{?git_branch  ⎇ {git_branch}} · ctx {ctx_pct}{?leaf  {leaf}}{?holds  ⏳{holds}}{?workers_extra  ⚡{workers}}{right}{hints} ";
 
 /// Minimalist status bar preset.
-pub const PRESET_MINIMAL: &str = " {dot} {mode} {right}{model} · {ctx_pct} ";
+pub const PRESET_MINIMAL: &str = " {dot} {mode} {right}{model}{?effort  ({effort})} · {ctx_pct} ";
 
 /// Full telemetry status bar preset.
-pub const PRESET_FULL: &str = " {dot} [{worker}] {dir}{?git_branch ({git_branch})} │ {model} │ ctx {ctx} │ tok {tokens} │ !:{bang_mode}{?leaf │ {leaf}}{?holds │ holds:{holds}}{right}{mode} · ? ";
+pub const PRESET_FULL: &str = " {dot} [{worker}] {dir}{?git_branch ({git_branch})} │ {model}{?effort  ({effort})} │ ctx {ctx} │ tok {tokens}{?cache_pct │ cache {cache_pct}}{?elapsed │ {elapsed}} │ !:{bang_mode}{?leaf │ {leaf}}{?holds │ holds:{holds}}{right}{mode} · ? ";
 
 /// Documentation table for `/statusbar vars`.
 pub const AVAILABLE_VARS: &[(&str, &str)] = &[
@@ -37,6 +40,7 @@ pub const AVAILABLE_VARS: &[(&str, &str)] = &[
     ("worker", "Focused worker ID (main, w1, ...)"),
     ("agent", "Active *.agent filename"),
     ("model", "Active LLM model ID"),
+    ("effort", "Active reasoning effort level (empty if default)"),
     ("provider", "Active LLM provider name"),
     ("dir", "Current working directory basename"),
     ("cwd", "Full current working directory path"),
@@ -46,11 +50,24 @@ pub const AVAILABLE_VARS: &[(&str, &str)] = &[
     ),
     ("ctx_pct", "Context watermark percentage (e.g. 12%)"),
     ("ctx_tokens", "Current context tokens (e.g. 15.3k)"),
-    ("ctx_max", "Max context window tokens (e.g. 128.0k)"),
-    ("ctx", "Full context readout (e.g. 12% (15.3k/128.0k))"),
+    ("ctx_max", "Max context window tokens (e.g. 256.0k)"),
+    ("ctx", "Full context readout (e.g. 12% (15.3k/256.0k))"),
     ("in_tokens", "Session input tokens (e.g. 24.1k)"),
     ("out_tokens", "Session output tokens (e.g. 3.2k)"),
     ("tokens", "Combined session tokens (in/out)"),
+    ("cache_pct", "Prompt cache hit rate (e.g. 84%, empty if 0)"),
+    (
+        "cached",
+        "Session cached input tokens (e.g. 18.2k, empty if 0)",
+    ),
+    (
+        "reasoning",
+        "Session reasoning tokens (e.g. 4.1k, empty if 0)",
+    ),
+    (
+        "elapsed",
+        "Live active turn elapsed time (e.g. 6s, empty if idle)",
+    ),
     ("leaf", "Active Tree WAL leaf ID (e.g. #14, empty if fresh)"),
     ("holds", "Active hold lease count (empty if 0)"),
     ("workers", "Total running worker count"),
@@ -73,6 +90,7 @@ pub struct StatusVars {
     pub worker: String,
     pub agent: String,
     pub model: String,
+    pub effort: Option<String>,
     pub provider: String,
     pub cwd: String,
     pub dir: String,
@@ -82,6 +100,10 @@ pub struct StatusVars {
     pub ctx_max: String,
     pub in_tokens: String,
     pub out_tokens: String,
+    pub cache_pct_num: Option<u64>,
+    pub cached_tokens: String,
+    pub reasoning_tokens: String,
+    pub elapsed_secs: Option<u64>,
     pub leaf: Option<u64>,
     pub holds: usize,
     pub workers: usize,
@@ -122,6 +144,10 @@ impl StatusVars {
             )),
             "agent" => Some((self.agent.clone(), Style::default().fg(Color::White))),
             "model" => Some((self.model.clone(), Style::default().fg(Color::Cyan))),
+            "effort" => Some((
+                self.effort.clone().unwrap_or_default(),
+                Style::default().fg(Color::Magenta),
+            )),
             "provider" => Some((self.provider.clone(), Style::default().fg(Color::Gray))),
             "dir" => Some((self.dir.clone(), Style::default().fg(Color::Blue))),
             "cwd" => Some((self.cwd.clone(), Style::default().fg(Color::Gray))),
@@ -162,6 +188,28 @@ impl StatusVars {
                 format!("{}/{}", self.in_tokens, self.out_tokens),
                 Style::default().fg(Color::Gray),
             )),
+            "cache_pct" => {
+                let (txt, color) = match self.cache_pct_num {
+                    Some(p) if p >= 50 => (format!("{p}%"), Color::Green),
+                    Some(p) if p > 0 => (format!("{p}%"), Color::Yellow),
+                    _ => (String::new(), Color::DarkGray),
+                };
+                Some((txt, Style::default().fg(color)))
+            }
+            "cached" => Some((
+                self.cached_tokens.clone(),
+                Style::default().fg(Color::Green),
+            )),
+            "reasoning" => Some((
+                self.reasoning_tokens.clone(),
+                Style::default().fg(Color::Magenta),
+            )),
+            "elapsed" => Some((
+                self.elapsed_secs
+                    .map(|s| format!("{s}s"))
+                    .unwrap_or_default(),
+                Style::default().fg(Color::Cyan),
+            )),
             "leaf" => Some((
                 self.leaf.map(|l| format!("#{l}")).unwrap_or_default(),
                 Style::default().fg(Color::Gray),
@@ -198,8 +246,13 @@ impl StatusVars {
     fn is_truthy(&self, name: &str) -> bool {
         match name {
             "busy" => self.busy,
+            "effort" => self.effort.as_deref().is_some_and(|s| !s.is_empty()),
             "git_branch" => self.git_branch.as_deref().is_some_and(|s| !s.is_empty()),
             "leaf" => self.leaf.is_some(),
+            "cache_pct" => self.cache_pct_num.is_some_and(|p| p > 0),
+            "cached" => !self.cached_tokens.is_empty(),
+            "reasoning" => !self.reasoning_tokens.is_empty(),
+            "elapsed" => self.elapsed_secs.is_some(),
             "holds" => self.holds > 0,
             "workers_extra" => self.workers > 1,
             other => self
@@ -458,6 +511,7 @@ mod tests {
             worker: "main".into(),
             agent: "default.agent".into(),
             model: "deepseek-v4.1".into(),
+            effort: Some("xhigh".into()),
             provider: "openai-responses".into(),
             cwd: "/tmp/demo".into(),
             dir: "demo".into(),
@@ -467,6 +521,10 @@ mod tests {
             ctx_max: "128.0k".into(),
             in_tokens: "10.0k".into(),
             out_tokens: "2.0k".into(),
+            cache_pct_num: Some(80),
+            cached_tokens: "8.0k".into(),
+            reasoning_tokens: "1.2k".into(),
+            elapsed_secs: None,
             leaf: Some(7),
             holds: 0,
             workers: 1,
@@ -476,7 +534,7 @@ mod tests {
         let line = render_status_bar(DEFAULT_STATUS_BAR, &vars, 100);
         let text = line.to_string();
         assert!(text.contains("ask"));
-        assert!(text.contains("deepseek-v4.1"));
+        assert!(text.contains("deepseek-v4.1 (xhigh)"));
         assert!(text.contains("⎇ main"));
         assert!(text.contains("ctx 12%"));
         assert!(text.contains("#7"));

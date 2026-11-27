@@ -69,9 +69,9 @@ anix-agent --mode plan
 
 ## Roadmap / TODO
 
+* [x] **Persistent input history + `Ctrl+R` reverse search**: persists prompt history across sessions (`~/.local/share/anix-agent/history.jsonl`) with interactive `Ctrl+R` incremental search.
+* [x] **Clipboard image paste (`Ctrl+V`) & drag-and-drop image paths**: captures clipboard images to private temp files or detects dragged `.png/.jpg/.webp/.gif` paths as `[Image #N]` chips and passes them natively via `Anix-Media:` Maildir headers.
 * [ ] **Code rollback in `/rewind`**: capture zero-pollution workspace snapshots per user turn via a temporary `GIT_INDEX_FILE` + `git write-tree` (stored as `wal_leaf_id -> tree_sha` in session metadata, without touching `.git/index` or `git stash`), enabling *Restore code & conversation* and *Restore code only* even for arbitrary `msh`/shell edits.
-* [ ] **Persistent input history**: persist `↑`/`↓` prompt history across sessions (`~/.local/share/anix-agent/history`).
-* [ ] **Clipboard image paste (`Ctrl+V`)**: save pasted images to temp files and attach via Anix's native `MediaAttachment` protocol.
 
 ## License
 

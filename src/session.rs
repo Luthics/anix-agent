@@ -23,12 +23,13 @@ shell: msh
 output: reply
 stderr: auto
 max_turns: 40
-max_tokens: 128000
-compact_threshold: 0.8
 ---
-You are an expert POSIX systems and software engineering agent running inside `anix-agent`.
-Be concise, accurate, and pragmatic. Inspect before editing, verify changes with real commands/tests,
-and summarize results clearly in Markdown.
+You are an expert POSIX systems and software engineering agent running inside the interactive `anix-agent` TUI workbench.
+Be concise, accurate, and pragmatic. Inspect before editing, verify changes with real commands/tests, and summarize results clearly in Markdown.
+
+Workbench capabilities:
+- Your `shell` tool runs through the user's approval policy (`ask`/`auto`/`plan`); if a command is denied or edited, respect the user's feedback and never bypass approval.
+- Built-in CLI helpers on `$PATH`: `aview <image|pdf>` to visually inspect local images/PDFs; `aplan` (`aplan <<'EOF'\n- [x] ...\n- [~] ...\n- [ ] ...\nEOF`, or `aplan clear`) to update the live TUI progress checklist on multi-step tasks without bloating history; `aclr -t <turn_id> \"<summary>\"` to fold dead-end exploration without breaking prompt cache; `anix fork \"$ANIX_WAL\" --leaf \"$ANIX_LEAF\" -o <branch.wal>` + `\"$ANIX_AGENT\" -q -c <branch.wal>` to self-fork parallel sub-agents inheriting your current context (see `<runtime_tips>` for full recipes).
 ";
 
 /// Persistent metadata stored per interactive session (`meta.json`).
@@ -42,6 +43,8 @@ pub struct SessionMeta {
     pub agent_path: PathBuf,
     pub model: Option<String>,
     pub provider: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     pub active_wal: PathBuf,
     pub active_leaf: Option<u64>,
     pub approval_policy: ApprovalPolicy,
@@ -62,6 +65,14 @@ pub struct CustomSlashEntry {
     /// Origin badge shown in completion menu (`user`, `project`, or `skill`).
     pub source_tag: &'static str,
     pub kind: CustomSlashKind,
+}
+
+/// Persistent cross-session prompt history entry (`~/.local/share/anix-agent/history.jsonl`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub ts: String,
+    pub cwd: String,
+    pub text: String,
 }
 
 /// Summary row shown in `/resume` and `/sessions`.
@@ -238,21 +249,17 @@ impl SessionStore {
         out
     }
 
-    /// Create a brand-new persistent session directory (`main.wal.jsonl`, `branches/`, `inbox/`, `meta.json`).
-    pub fn create_session(
+    /// Build an in-memory draft session without creating any files or directories on disk yet.
+    /// Call [`Self::materialize_session`] once the user actually sends their first message.
+    pub fn draft_session(
         &self,
         agent_path: PathBuf,
         model: Option<String>,
         provider: Option<String>,
         approval_policy: ApprovalPolicy,
-    ) -> io::Result<(PathBuf, SessionMeta)> {
+    ) -> (PathBuf, SessionMeta) {
         let id = format!("s-{}", &Uuid::new_v4().simple().to_string()[..10]);
         let session_dir = self.project_sessions_dir().join(&id);
-        ensure_dir_0700(&session_dir)?;
-        ensure_dir_0700(&session_dir.join("branches"))?;
-        ensure_dir_0700(&session_dir.join("inbox"))?;
-        ensure_dir_0700(&session_dir.join("workers"))?;
-
         let now = now_rfc3339();
         let meta = SessionMeta {
             id,
@@ -263,12 +270,120 @@ impl SessionStore {
             agent_path,
             model,
             provider,
+            reasoning_effort: None,
             active_wal: session_dir.join("main.wal.jsonl"),
             active_leaf: None,
             approval_policy,
         };
-        save_session_meta(&session_dir, &meta)?;
+        (session_dir, meta)
+    }
+
+    /// Persist a draft session directory (`branches/`, `inbox/`, `workers/`, `meta.json`) on disk.
+    pub fn materialize_session(&self, session_dir: &Path, meta: &SessionMeta) -> io::Result<()> {
+        ensure_dir_0700(session_dir)?;
+        ensure_dir_0700(&session_dir.join("branches"))?;
+        ensure_dir_0700(&session_dir.join("inbox"))?;
+        ensure_dir_0700(&session_dir.join("workers"))?;
+        save_session_meta(session_dir, meta)
+    }
+
+    /// Create and immediately persist a session directory (`main.wal.jsonl`, `branches/`, `inbox/`, `meta.json`).
+    pub fn create_session(
+        &self,
+        agent_path: PathBuf,
+        model: Option<String>,
+        provider: Option<String>,
+        approval_policy: ApprovalPolicy,
+    ) -> io::Result<(PathBuf, SessionMeta)> {
+        let (session_dir, meta) = self.draft_session(agent_path, model, provider, approval_policy);
+        self.materialize_session(&session_dir, &meta)?;
         Ok((session_dir, meta))
+    }
+
+    /// Lightweight read-only peek at effective `(model, provider, max_tokens)` from `agent_path`
+    /// frontmatter + `~/.config/anix/config.toml` `[defaults]` so an unsaved draft session can
+    /// render accurate status bar & `/context` info before spawning `anix`.
+    pub fn preview_agent_defaults(
+        &self,
+        agent_path: &Path,
+        explicit_config: Option<&Path>,
+    ) -> (Option<String>, Option<String>, u32) {
+        let mut model: Option<String> = None;
+        let mut provider: Option<String> = None;
+        let mut max_tokens: Option<u32> = None;
+
+        if let Ok(raw) = fs::read_to_string(agent_path) {
+            let mut in_fm = false;
+            for line in raw.lines() {
+                let t = line.trim();
+                if t == "---" {
+                    if !in_fm {
+                        in_fm = true;
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+                if !in_fm {
+                    continue;
+                }
+                if let Some((k, v)) = t.split_once(':') {
+                    let key = k.trim();
+                    let val = v.trim().trim_matches(|c| c == '"' || c == '\'');
+                    if val.is_empty() {
+                        continue;
+                    }
+                    match key {
+                        "model" if model.is_none() => model = Some(val.to_owned()),
+                        "provider" if provider.is_none() => provider = Some(val.to_owned()),
+                        "max_tokens" if max_tokens.is_none() => max_tokens = val.parse().ok(),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let cfg_path = explicit_config.map(Path::to_path_buf).unwrap_or_else(|| {
+            self.config_agents_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.home_dir.join(".config/anix"))
+                .join("config.toml")
+        });
+        if let Ok(raw) = fs::read_to_string(&cfg_path) {
+            let mut in_defaults = false;
+            for line in raw.lines() {
+                let t = line.split('#').next().unwrap_or("").trim();
+                if t.is_empty() {
+                    continue;
+                }
+                if t.starts_with('[') {
+                    in_defaults = t == "[defaults]";
+                    continue;
+                }
+                if !in_defaults {
+                    continue;
+                }
+                if let Some((k, v)) = t.split_once('=') {
+                    let key = k.trim();
+                    let val = v.trim().trim_matches(|c| c == '"' || c == '\'');
+                    match key {
+                        "model" if model.is_none() && !val.is_empty() => {
+                            model = Some(val.to_owned())
+                        }
+                        "provider" if provider.is_none() && !val.is_empty() => {
+                            provider = Some(val.to_owned())
+                        }
+                        "max_tokens" if max_tokens.is_none() => {
+                            max_tokens = val.replace('_', "").parse().ok()
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        (model, provider, max_tokens.unwrap_or(256_000))
     }
 
     /// List all sessions for the current working directory, newest first.
@@ -311,6 +426,64 @@ impl SessionStore {
             ));
         }
         fs::remove_dir_all(&target)
+    }
+
+    /// Path to persistent cross-session input history (`${XDG_DATA_HOME}/anix-agent/history.jsonl`).
+    pub fn history_path(&self) -> PathBuf {
+        self.data_dir.join("history.jsonl")
+    }
+
+    /// Load up to `max_entries` most recent persistent prompt history entries (oldest -> newest).
+    pub fn load_input_history(&self, max_entries: usize) -> Vec<HistoryEntry> {
+        let Ok(raw) = fs::read_to_string(self.history_path()) else {
+            return Vec::new();
+        };
+        let mut entries = Vec::new();
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(entry) = serde_json::from_str::<HistoryEntry>(trimmed) {
+                if entry.text.trim().is_empty() {
+                    continue;
+                }
+                if entries
+                    .last()
+                    .is_some_and(|prev: &HistoryEntry| prev.text == entry.text)
+                {
+                    continue;
+                }
+                entries.push(entry);
+            }
+        }
+        if entries.len() > max_entries {
+            entries.drain(0..entries.len() - max_entries);
+        }
+        entries
+    }
+
+    /// Append a submitted prompt to persistent cross-session history (`0600`, JSONL).
+    pub fn append_input_history(&self, text: &str) -> io::Result<()> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        ensure_dir_0700(&self.data_dir)?;
+        let path = self.history_path();
+        let entry = HistoryEntry {
+            ts: now_rfc3339(),
+            cwd: self.cwd.display().to_string(),
+            text: trimmed.to_owned(),
+        };
+        let line = serde_json::to_string(&entry).map_err(io::Error::other)?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&path)?;
+        writeln!(f, "{line}")?;
+        Ok(())
     }
 
     /// Find a session by `"latest"` or exact/prefix ID match (checks current project first, then all).
@@ -477,6 +650,9 @@ fn read_sessions_in_dir(project_dir: &Path, is_current_project: bool) -> Vec<Ses
         };
         let wal_bytes = fs::metadata(&meta.active_wal).map(|m| m.len()).unwrap_or(0);
         let turn_count = count_wal_steps(&meta.active_wal);
+        if is_session_empty(&dir, &meta) {
+            continue;
+        }
         let project_label = meta
             .cwd
             .file_name()
@@ -493,6 +669,31 @@ fn read_sessions_in_dir(project_dir: &Path, is_current_project: bool) -> Vec<Ses
         });
     }
     list
+}
+
+/// Returns `true` when a session directory has no user/assistant/tool messages yet and no forked
+/// branch WALs (e.g. a freshly opened workbench where the user immediately ran `/resume` or quit).
+pub fn is_session_empty(session_dir: &Path, meta: &SessionMeta) -> bool {
+    if count_wal_steps(&meta.active_wal) > 0 {
+        return false;
+    }
+    if let Ok(raw) = fs::read_to_string(&meta.active_wal)
+        && raw.contains("\"type\":\"branch_base\"")
+    {
+        return false;
+    }
+    let branches_dir = session_dir.join("branches");
+    if let Ok(entries) = fs::read_dir(&branches_dir)
+        && entries.flatten().any(|e| {
+            e.path()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".wal.jsonl"))
+        })
+    {
+        return false;
+    }
+    true
 }
 
 fn count_wal_steps(wal_path: &Path) -> usize {

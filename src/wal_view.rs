@@ -6,6 +6,7 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+use anix_proto::provider::TokenUsage;
 use anix_proto::wal::{WalEvent, WalRole};
 
 /// Summarized node in a Tree WAL graph (for `/tree` rendering and `/inspect`).
@@ -69,6 +70,365 @@ pub struct ContextBreakdown {
     pub message_count: usize,
     pub tool_count: usize,
     pub fold_count: usize,
+}
+
+/// Full untruncated detail item (thinking block or tool execution) shown in the `Ctrl+O`
+/// scrollable transcript overlay.
+#[derive(Debug, Clone)]
+pub enum DetailEntry {
+    Thought {
+        ts: String,
+        text: String,
+    },
+    Tool {
+        ts: String,
+        name: String,
+        cmd: String,
+        exit_code: Option<i32>,
+        output: String,
+    },
+}
+
+/// Read-only extraction of full untruncated thinking & tool execution details along the active WAL
+/// lineage (powers `Ctrl+O` transcript inspection even right after `-r` / `/resume`).
+pub fn load_wal_detail_entries(
+    wal_path: &Path,
+    active_leaf: Option<u64>,
+    max_entries: usize,
+) -> Vec<DetailEntry> {
+    if !wal_path.is_file() {
+        return Vec::new();
+    }
+    let mut visited = HashSet::new();
+    let events = collect_lineage_events(wal_path, active_leaf, &mut visited);
+    if events.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out: Vec<DetailEntry> = Vec::new();
+    let mut pending_calls: HashMap<String, (String, String, String)> = HashMap::new();
+
+    for ev in events {
+        if let WalEvent::Message {
+            role,
+            ts,
+            text,
+            reasoning,
+            tool_calls,
+            tool_call_id,
+            is_error,
+            ..
+        } = ev
+        {
+            match role {
+                WalRole::Assistant => {
+                    if let Some(r) = reasoning
+                        && !r.trim().is_empty()
+                    {
+                        out.push(DetailEntry::Thought {
+                            ts: ts.clone(),
+                            text: r,
+                        });
+                    }
+                    for tc in tool_calls {
+                        let cmd = tc
+                            .arguments
+                            .get("command")
+                            .or_else(|| tc.arguments.get("cmd"))
+                            .and_then(|v| v.as_str())
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| tc.arguments.to_string());
+                        pending_calls.insert(tc.id, (tc.name, cmd, ts.clone()));
+                    }
+                }
+                WalRole::Tool => {
+                    let (name, cmd, call_ts) = tool_call_id
+                        .as_ref()
+                        .and_then(|id| pending_calls.remove(id))
+                        .unwrap_or_else(|| ("tool".into(), "(command)".into(), ts.clone()));
+                    out.push(DetailEntry::Tool {
+                        ts: call_ts,
+                        name,
+                        cmd,
+                        exit_code: Some(if is_error { 1 } else { 0 }),
+                        output: text.unwrap_or_default(),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if out.len() > max_entries {
+        out.drain(0..out.len() - max_entries);
+    }
+    out
+}
+
+/// Read-only extraction of the most recent non-empty assistant text reply along the active WAL
+/// lineage (powers `/copy` even immediately after `-r` / `/resume`).
+pub fn load_last_assistant_reply(wal_path: &Path, active_leaf: Option<u64>) -> Option<String> {
+    if !wal_path.is_file() {
+        return None;
+    }
+    let mut visited = HashSet::new();
+    let events = collect_lineage_events(wal_path, active_leaf, &mut visited);
+    for ev in events.into_iter().rev() {
+        if let WalEvent::Message {
+            role: WalRole::Assistant,
+            text: Some(t),
+            ..
+        } = ev
+            && !t.trim().is_empty()
+        {
+            return Some(t);
+        }
+    }
+    None
+}
+
+/// Metadata header attached to `/export` Markdown transcripts.
+#[derive(Debug, Clone, Copy)]
+pub struct ExportMetadata<'a> {
+    pub session_id: &'a str,
+    pub title: &'a str,
+    pub cwd: &'a str,
+    pub model: &'a str,
+    pub exported_at: &'a str,
+}
+
+/// Export the active WAL lineage (crossing `branch_base` forks strictly read-only) into a clean,
+/// shareable Markdown transcript with collapsible thinking and tool execution blocks.
+pub fn export_wal_to_markdown(
+    wal_path: &Path,
+    active_leaf: Option<u64>,
+    meta: ExportMetadata<'_>,
+) -> Option<String> {
+    if !wal_path.is_file() {
+        return None;
+    }
+    let mut visited = HashSet::new();
+    let events = collect_lineage_events(wal_path, active_leaf, &mut visited);
+    if events.is_empty() {
+        return None;
+    }
+
+    let (usage, _) = load_wal_usage_summary(wal_path, active_leaf);
+    let mut body = String::new();
+    let mut pending_calls: HashMap<String, (String, String)> = HashMap::new();
+    let mut turn_count = 0usize;
+
+    for ev in events {
+        match ev {
+            WalEvent::Message {
+                role,
+                ts,
+                text,
+                reasoning,
+                tool_calls,
+                tool_call_id,
+                is_error,
+                ..
+            } => match role {
+                WalRole::User => {
+                    let clean = unwrap_maildir_input(text.as_deref().unwrap_or(""));
+                    let t = clean.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    turn_count += 1;
+                    body.push_str(&format!("## User ({})\n\n{}\n\n", short_ts(&ts), t));
+                }
+                WalRole::Assistant => {
+                    let clean_text = text.as_deref().unwrap_or("").trim();
+                    let clean_reason = reasoning.as_deref().unwrap_or("").trim();
+                    for tc in &tool_calls {
+                        let cmd = tc
+                            .arguments
+                            .get("command")
+                            .or_else(|| tc.arguments.get("cmd"))
+                            .and_then(|v| v.as_str())
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| tc.arguments.to_string());
+                        pending_calls.insert(tc.id.clone(), (tc.name.clone(), cmd));
+                    }
+                    if clean_text.is_empty() && clean_reason.is_empty() {
+                        continue;
+                    }
+                    turn_count += 1;
+                    body.push_str(&format!("## Assistant ({})\n\n", short_ts(&ts)));
+                    if !clean_reason.is_empty() {
+                        body.push_str("<details>\n<summary>Thinking</summary>\n\n");
+                        body.push_str(clean_reason);
+                        body.push_str("\n\n</details>\n\n");
+                    }
+                    if !clean_text.is_empty() {
+                        body.push_str(clean_text);
+                        body.push_str("\n\n");
+                    }
+                }
+                WalRole::Tool => {
+                    let (name, cmd) = tool_call_id
+                        .as_ref()
+                        .and_then(|id| pending_calls.remove(id))
+                        .unwrap_or_else(|| ("tool".into(), "(command)".into()));
+                    let status = if is_error { "error" } else { "ok" };
+                    let summary_cmd = truncate_one_line(&cmd, 96).replace('<', "&lt;");
+                    let out_raw = text.unwrap_or_default();
+                    let fence_lang = if out_raw.starts_with("diff --git ")
+                        || (out_raw.contains("\n--- ") && out_raw.contains("\n+++ "))
+                    {
+                        "diff"
+                    } else {
+                        "text"
+                    };
+                    body.push_str(&format!(
+                        "<details>\n<summary>Tool: <code>{}({})</code> [{}]</summary>\n\n```{}\n{}\n```\n\n</details>\n\n",
+                        name,
+                        summary_cmd,
+                        status,
+                        fence_lang,
+                        out_raw.trim_end()
+                    ));
+                }
+                WalRole::System => {}
+            },
+            WalEvent::Fold {
+                from_turn,
+                to_turn,
+                summary,
+                ..
+            } => {
+                body.push_str(&format!(
+                    "> **Context Fold** (turns {from_turn}..{to_turn}): {}\n\n",
+                    summary.trim()
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    if turn_count == 0 {
+        return None;
+    }
+
+    let heading = if meta.title.trim().is_empty() {
+        meta.session_id
+    } else {
+        meta.title.trim()
+    };
+    let mut md = String::with_capacity(body.len() + 512);
+    md.push_str(&format!("# {heading}\n\n"));
+    md.push_str(&format!("- **Session**: `{}`\n", meta.session_id));
+    if !meta.model.trim().is_empty() {
+        md.push_str(&format!("- **Model**: `{}`\n", meta.model));
+    }
+    if !meta.cwd.trim().is_empty() {
+        md.push_str(&format!("- **Directory**: `{}`\n", meta.cwd));
+    }
+    if let Some(leaf) = active_leaf {
+        md.push_str(&format!("- **Leaf**: `#{leaf}`\n"));
+    }
+    if usage.input_tokens > 0 || usage.output_tokens > 0 {
+        md.push_str(&format!(
+            "- **Tokens**: {} in / {} out (cached: {}, reasoning: {})\n",
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cached_tokens.unwrap_or(0),
+            usage.reasoning_tokens.unwrap_or(0)
+        ));
+    }
+    md.push_str(&format!("- **Exported**: {}\n\n---\n\n", meta.exported_at));
+    md.push_str(&body);
+    Some(md)
+}
+
+/// Read-only resumed session usage & estimated active context tokens reconstructed from the WAL
+/// lineage (instant fallback prior to or without `run_start` stats from `anix`).
+pub fn load_wal_usage_summary(
+    wal_path: &Path,
+    active_leaf: Option<u64>,
+) -> (TokenUsage, Option<u64>) {
+    if !wal_path.is_file() {
+        return (TokenUsage::default(), None);
+    }
+    let mut visited = HashSet::new();
+    let events = collect_lineage_events(wal_path, active_leaf, &mut visited);
+    if events.is_empty() {
+        return (TokenUsage::default(), None);
+    }
+
+    let mut total_usage = TokenUsage::default();
+    let mut last_assistant_idx: Option<(usize, TokenUsage)> = None;
+    let mut has_conversation = false;
+
+    for (idx, ev) in events.iter().enumerate() {
+        match ev {
+            WalEvent::Checkpoint {
+                cumulative_usage: Some(cu),
+                ..
+            } => {
+                total_usage = *cu;
+            }
+            WalEvent::Message { role, usage, .. } => {
+                if !matches!(role, WalRole::System) {
+                    has_conversation = true;
+                }
+                if let Some(u) = usage {
+                    total_usage.add_assign(u);
+                    if matches!(role, WalRole::Assistant) {
+                        last_assistant_idx = Some((idx, *u));
+                    }
+                }
+            }
+            WalEvent::Fold {
+                fold_usage,
+                pruned_usage,
+                ..
+            } => {
+                if let Some(fu) = fold_usage {
+                    total_usage.add_assign(fu);
+                }
+                if let Some(pu) = pruned_usage {
+                    total_usage.add_assign(pu);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let estimate_ev_tokens = |ev: &WalEvent| -> u64 {
+        match ev {
+            WalEvent::Message {
+                text,
+                reasoning,
+                tool_calls,
+                ..
+            } => {
+                let mut bytes = text.as_deref().map(str::len).unwrap_or(0)
+                    + reasoning.as_deref().map(str::len).unwrap_or(0);
+                for tc in tool_calls {
+                    bytes += tc.name.len() + tc.arguments.to_string().len();
+                }
+                ((bytes as u64) / 3).max(4)
+            }
+            WalEvent::RuntimeUpdate { content, .. } => ((content.len() as u64) / 3).max(4),
+            WalEvent::Fold { summary, .. } => ((summary.len() as u64) / 3).max(4),
+            _ => 0,
+        }
+    };
+
+    let ctx_tokens = if let Some((idx, u)) = last_assistant_idx {
+        let base = u.input_tokens.saturating_add(u.output_tokens);
+        let tail: u64 = events[idx + 1..].iter().map(estimate_ev_tokens).sum();
+        Some(base.saturating_add(tail))
+    } else if has_conversation {
+        Some(events.iter().map(estimate_ev_tokens).sum())
+    } else {
+        None
+    };
+
+    (total_usage, ctx_tokens)
 }
 
 /// Analyze token distribution along the active lineage of `wal_path` (strictly read-only,
@@ -876,7 +1236,13 @@ mod tests {
                 is_error: false,
                 media: Vec::new(),
                 provider_opaque: None,
-                usage: None,
+                usage: Some(TokenUsage {
+                    input_tokens: 12_000,
+                    output_tokens: 450,
+                    cached_tokens: Some(8_000),
+                    cache_write_tokens: None,
+                    reasoning_tokens: Some(120),
+                }),
                 message_ids: Vec::new(),
             })
             .unwrap(),
@@ -889,6 +1255,11 @@ mod tests {
         assert!(graph.find_node(5).unwrap().is_head);
         assert!(graph.find_node(3).unwrap().on_active_lineage);
         assert!(!graph.find_node(4).unwrap().on_active_lineage);
+
+        let (usage, ctx_tok) = load_wal_usage_summary(&tmp, None);
+        assert_eq!(usage.input_tokens, 12_000);
+        assert_eq!(usage.output_tokens, 450);
+        assert_eq!(ctx_tok, Some(12_450));
 
         let replay = load_recent_replay(&tmp, None, 10);
         assert_eq!(replay.len(), 2);
@@ -904,6 +1275,26 @@ mod tests {
             unwrap_maildir_input("<input source=\"a.msg\" from=\"user\">\nhello world\n</input>"),
             "hello world"
         );
+
+        let exported = export_wal_to_markdown(
+            &tmp,
+            None,
+            ExportMetadata {
+                session_id: "s-demo",
+                title: "Branch Demo",
+                cwd: "/tmp/demo",
+                model: "test-model",
+                exported_at: "2026-11-27T12:00:00Z",
+            },
+        )
+        .expect("should export active lineage");
+        assert!(exported.contains("# Branch Demo"));
+        assert!(exported.contains("12000 in / 450 out"));
+        assert!(exported.contains("## User"));
+        assert!(exported.contains("first"));
+        assert!(exported.contains("## Assistant"));
+        assert!(exported.contains("branch B"));
+        assert!(!exported.contains("branch A"));
 
         let _ = fs::remove_file(&tmp);
     }

@@ -8,17 +8,39 @@ use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+static NEXT_WORKER_INSTANCE: AtomicU64 = AtomicU64::new(1);
 
 use anix_proto::maildir::{MaildirEnvelope, MaildirHeaders};
 use anix_proto::provider::TokenUsage;
 use anix_proto::trace::{ContextWatermark, TraceEnvelope};
+use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::session::ensure_dir_0700;
+
+/// Status of an ephemeral live progress checklist step published via `aplan` / `plan_update`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanStepStatus {
+    Pending,
+    InProgress,
+    Done,
+    Skipped,
+    Failed,
+}
+
+/// Single checklist item emitted by `anix-core` on `--trace-fd` as a `plan_update` event.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PlanStep {
+    pub title: String,
+    pub status: PlanStepStatus,
+}
 
 /// Configuration used to launch or respawn a single persistent `anix --inbox` worker.
 #[derive(Debug, Clone)]
@@ -33,6 +55,12 @@ pub struct WorkerSpec {
     pub config_file: Option<PathBuf>,
     pub provider: Option<String>,
     pub model: Option<String>,
+    /// Logical reasoning effort tier shown in UI/status bar (e.g. `"off"`, `"high"`, `"xhigh"`).
+    pub reasoning_effort: Option<String>,
+    /// Resolved wire `--param KEY=VALUE` pairs for the active reasoning effort mapping.
+    /// `Some(vec)` emits exactly those pairs (empty = explicit `null`/omit); `None` falls back to
+    /// `--param reasoning_effort=<reasoning_effort>`.
+    pub effort_params: Option<Vec<(String, Value)>>,
     /// Underlying shell binary wrapped by `approve-wrap` (`None` -> `msh`, `Some("none")` -> pure-text).
     pub base_shell: Option<String>,
     pub approve_sock: PathBuf,
@@ -54,6 +82,8 @@ pub enum WorkerEvent {
         provider: String,
         shell: String,
         leaf_id: Option<u64>,
+        session_usage: Option<TokenUsage>,
+        context: Option<ContextWatermark>,
     },
     CycleStart {
         worker_id: String,
@@ -118,6 +148,10 @@ pub enum WorkerEvent {
         to_turn: u64,
         summary: String,
     },
+    PlanUpdate {
+        worker_id: String,
+        steps: Vec<PlanStep>,
+    },
     CycleEnd {
         worker_id: String,
         cycle_id: u64,
@@ -153,6 +187,41 @@ pub enum WorkerEvent {
     },
 }
 
+impl WorkerEvent {
+    pub fn worker_id(&self) -> &str {
+        match self {
+            Self::RunStart { worker_id, .. }
+            | Self::CycleStart { worker_id, .. }
+            | Self::InboxSteered { worker_id, .. }
+            | Self::ReasoningDelta { worker_id, .. }
+            | Self::TextDelta { worker_id, .. }
+            | Self::ToolStart { worker_id, .. }
+            | Self::ToolOutput { worker_id, .. }
+            | Self::ToolEnd { worker_id, .. }
+            | Self::HoldStarted { worker_id, .. }
+            | Self::HoldReleased { worker_id, .. }
+            | Self::HoldExpired { worker_id, .. }
+            | Self::Compact { worker_id, .. }
+            | Self::Fold { worker_id, .. }
+            | Self::PlanUpdate { worker_id, .. }
+            | Self::CycleEnd { worker_id, .. }
+            | Self::Idle { worker_id, .. }
+            | Self::ProviderError { worker_id, .. }
+            | Self::Warning { worker_id, .. }
+            | Self::StderrLine { worker_id, .. }
+            | Self::Exited { worker_id, .. } => worker_id,
+        }
+    }
+}
+
+/// Worker event tagged with the monotonic `instance_id` of the spawned `anix` process so the UI
+/// can safely drop stale trailing events from replaced or intentionally stopped workers.
+#[derive(Debug, Clone)]
+pub struct WorkerMessage {
+    pub instance_id: u64,
+    pub event: WorkerEvent,
+}
+
 /// Active hold lease tracked by the UI for display in status bar and `/workers`.
 #[derive(Debug, Clone)]
 pub struct TrackedHold {
@@ -164,8 +233,10 @@ pub struct TrackedHold {
 /// Running `anix --inbox` process handle owned by `anix-agent`.
 #[derive(Debug)]
 pub struct WorkerHandle {
+    pub instance_id: u64,
     pub spec: WorkerSpec,
     child: Option<Child>,
+    silenced: Arc<AtomicBool>,
     pub pid: u32,
     pub alive: bool,
     pub busy: bool,
@@ -179,7 +250,7 @@ pub struct WorkerHandle {
 
 impl WorkerHandle {
     /// Spawn a persistent `anix --inbox` child attached to a private `--trace-fd 9` pipe.
-    pub fn spawn(spec: WorkerSpec, tx: mpsc::Sender<WorkerEvent>) -> io::Result<Self> {
+    pub fn spawn(spec: WorkerSpec, tx: mpsc::Sender<WorkerMessage>) -> io::Result<Self> {
         ensure_maildir(&spec.inbox_dir)?;
 
         let (trace_r, trace_w) = create_pipe_cloexec()?;
@@ -217,6 +288,21 @@ impl WorkerHandle {
         }
         if let Some(ref model) = spec.model {
             cmd.args(["--model", model]);
+        }
+        match spec.effort_params {
+            Some(ref params) => {
+                for (k, v) in params {
+                    cmd.args(["--param", &format_cli_param(k, v)]);
+                }
+            }
+            None => {
+                if let Some(ref effort) = spec.reasoning_effort {
+                    let eff = effort.trim();
+                    if !eff.is_empty() && !eff.eq_ignore_ascii_case("default") {
+                        cmd.args(["--param", &format!("reasoning_effort={eff}")]);
+                    }
+                }
+            }
         }
         if let Some(ref sb) = spec.sandbox {
             cmd.arg(format!("--sandbox={sb}"));
@@ -293,22 +379,31 @@ impl WorkerHandle {
             }
         };
         let pid = child.id();
+        let instance_id = NEXT_WORKER_INSTANCE.fetch_add(1, Ordering::Relaxed);
+        let silenced = Arc::new(AtomicBool::new(false));
 
         // Spawn trace JSONL reader thread.
         let worker_id_trace = spec.id.clone();
         let tx_trace = tx.clone();
+        let silenced_trace = Arc::clone(&silenced);
         // SAFETY: `trace_r` is exclusively owned by this thread.
         let trace_file = unsafe { File::from_raw_fd(trace_r) };
         thread::spawn(move || {
             let reader = BufReader::new(trace_file);
             for line_res in reader.lines() {
+                if silenced_trace.load(Ordering::Acquire) {
+                    break;
+                }
                 let Ok(line) = line_res else { break };
+                if silenced_trace.load(Ordering::Acquire) {
+                    break;
+                }
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
                 }
-                if let Some(ev) = parse_trace_line(&worker_id_trace, trimmed)
-                    && tx_trace.send(ev).is_err()
+                if let Some(event) = parse_trace_line(&worker_id_trace, trimmed)
+                    && tx_trace.send(WorkerMessage { instance_id, event }).is_err()
                 {
                     break;
                 }
@@ -319,15 +414,25 @@ impl WorkerHandle {
         if let Some(stderr_pipe) = child.stderr.take() {
             let worker_id_err = spec.id.clone();
             let tx_err = tx;
+            let silenced_err = Arc::clone(&silenced);
             thread::spawn(move || {
                 let reader = BufReader::new(stderr_pipe);
                 for line_res in reader.lines() {
+                    if silenced_err.load(Ordering::Acquire) {
+                        break;
+                    }
                     let Ok(line) = line_res else { break };
+                    if silenced_err.load(Ordering::Acquire) {
+                        break;
+                    }
                     if !line.trim().is_empty()
                         && tx_err
-                            .send(WorkerEvent::StderrLine {
-                                worker_id: worker_id_err.clone(),
-                                line,
+                            .send(WorkerMessage {
+                                instance_id,
+                                event: WorkerEvent::StderrLine {
+                                    worker_id: worker_id_err.clone(),
+                                    line,
+                                },
                             })
                             .is_err()
                     {
@@ -338,11 +443,13 @@ impl WorkerHandle {
         }
 
         Ok(Self {
+            instance_id,
             current_model: spec.model.clone().unwrap_or_default(),
             current_provider: spec.provider.clone().unwrap_or_default(),
             current_leaf: spec.leaf,
             spec,
             child: Some(child),
+            silenced,
             pid,
             alive: true,
             busy: false,
@@ -352,15 +459,21 @@ impl WorkerHandle {
         })
     }
 
-    /// Non-blocking check whether the child process has exited.
+    /// Non-blocking check whether the child process has exited unexpectedly.
     pub fn poll_exit(&mut self) -> Option<i32> {
         let child = self.child.as_mut()?;
         match child.try_wait() {
             Ok(Some(st)) => {
+                let was_alive = self.alive;
+                let was_silenced = self.silenced.load(Ordering::Acquire);
                 self.alive = false;
                 self.busy = false;
                 self.child = None;
-                Some(st.code().unwrap_or(1))
+                if was_alive && !was_silenced {
+                    Some(st.code().unwrap_or(1))
+                } else {
+                    None
+                }
             }
             _ => None,
         }
@@ -368,7 +481,17 @@ impl WorkerHandle {
 
     /// Deliver a user prompt atomically to this worker's Maildir inbox (`tmp -> fsync -> new`).
     pub fn send_prompt(&mut self, text: &str, from: &str) -> io::Result<String> {
-        self.send_prompt_with_reply_to(text, from, None)
+        self.send_prompt_with_media(text, from, &[])
+    }
+
+    /// Deliver a user prompt with optional local image attachments (`Anix-Media: <mime> <path>`).
+    pub fn send_prompt_with_media(
+        &mut self,
+        text: &str,
+        from: &str,
+        media: &[(String, PathBuf)],
+    ) -> io::Result<String> {
+        self.send_prompt_with_reply_and_media(text, from, None, media)
     }
 
     /// Deliver a prompt with an optional `Anix-Reply-To` Maildir path.
@@ -377,6 +500,16 @@ impl WorkerHandle {
         text: &str,
         from: &str,
         reply_to: Option<&Path>,
+    ) -> io::Result<String> {
+        self.send_prompt_with_reply_and_media(text, from, reply_to, &[])
+    }
+
+    fn send_prompt_with_reply_and_media(
+        &mut self,
+        text: &str,
+        from: &str,
+        reply_to: Option<&Path>,
+        media: &[(String, PathBuf)],
     ) -> io::Result<String> {
         let msg_id = format!("ui_{}", Uuid::new_v4().simple());
         let env = MaildirEnvelope {
@@ -390,7 +523,25 @@ impl WorkerHandle {
             },
             body: text.to_owned(),
         };
-        deliver_maildir_atomic(&self.spec.inbox_dir, &env)?;
+        let encoded = if media.is_empty() {
+            env.format()
+        } else {
+            let mut extra = String::new();
+            for (mime, path) in media {
+                extra.push_str("Anix-Media: ");
+                extra.push_str(mime.trim());
+                extra.push(' ');
+                extra.push_str(&path.display().to_string().replace(['\r', '\n'], " "));
+                extra.push('\n');
+            }
+            let base = env.format();
+            if let Some((hdrs, body)) = base.split_once("\n\n") {
+                format!("{hdrs}\n{extra}\n{body}")
+            } else {
+                format!("{extra}\n{base}")
+            }
+        };
+        deliver_maildir_raw(&self.spec.inbox_dir, &encoded)?;
         self.busy = true;
         Ok(msg_id)
     }
@@ -415,6 +566,9 @@ impl WorkerHandle {
 
     /// Gracefully stop the worker (`SIGINT` or `SIGTERM` -> up to 3.5s grace -> `SIGKILL`).
     pub fn stop(&mut self, sig: libc::c_int) {
+        // Silence trace/stderr forwarding BEFORE signaling so intentional restarts never leak a
+        // trailing `run_end` (`exit=143`) into the UI or corrupt a newly spawned replacement.
+        self.silenced.store(true, Ordering::SeqCst);
         let Some(mut child) = self.child.take() else {
             self.alive = false;
             self.busy = false;
@@ -477,6 +631,10 @@ pub fn run_anix_fork(
 
 /// Atomically deliver a [`MaildirEnvelope`] into `<dir>/new/`.
 pub fn deliver_maildir_atomic(dir: &Path, envelope: &MaildirEnvelope) -> io::Result<String> {
+    deliver_maildir_raw(dir, &envelope.format())
+}
+
+fn deliver_maildir_raw(dir: &Path, encoded: &str) -> io::Result<String> {
     ensure_maildir(dir)?;
     let ts_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -488,7 +646,6 @@ pub fn deliver_maildir_atomic(dir: &Path, envelope: &MaildirEnvelope) -> io::Res
     let tmp_path = dir.join("tmp").join(&filename);
     let new_path = dir.join("new").join(&filename);
 
-    let encoded = envelope.format();
     let mut f = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -522,6 +679,12 @@ fn parse_trace_line(worker_id: &str, line: &str) -> Option<WorkerEvent> {
             provider: str_field(f.get("provider")),
             shell: str_field(f.get("shell")),
             leaf_id: f.get("leaf_id").and_then(Value::as_u64),
+            session_usage: f
+                .get("session_usage")
+                .and_then(|v| serde_json::from_value::<TokenUsage>(v.clone()).ok()),
+            context: f
+                .get("context")
+                .and_then(|v| serde_json::from_value::<ContextWatermark>(v.clone()).ok()),
         }),
         "cycle_start" => Some(WorkerEvent::CycleStart {
             worker_id: wid,
@@ -595,6 +758,16 @@ fn parse_trace_line(worker_id: &str, line: &str) -> Option<WorkerEvent> {
             to_turn: f.get("to_turn").and_then(Value::as_u64).unwrap_or(0),
             summary: str_field(f.get("summary")),
         }),
+        "plan_update" => {
+            let steps = f
+                .get("steps")
+                .and_then(|v| serde_json::from_value::<Vec<PlanStep>>(v.clone()).ok())
+                .unwrap_or_default();
+            Some(WorkerEvent::PlanUpdate {
+                worker_id: wid,
+                steps,
+            })
+        }
         "cycle_end" => Some(WorkerEvent::CycleEnd {
             worker_id: wid,
             cycle_id: f.get("cycle_id").and_then(Value::as_u64).unwrap_or(0),
@@ -663,6 +836,20 @@ fn env_self_exe() -> PathBuf {
     std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anix-agent"))
 }
 
+fn format_cli_param(key: &str, val: &Value) -> String {
+    if let Value::String(s) = val
+        && !s.is_empty()
+        && !matches!(s.as_str(), "true" | "false" | "null")
+        && !s.as_bytes()[0].is_ascii_digit()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return format!("{key}={s}");
+    }
+    let encoded = serde_json::to_string(val).unwrap_or_else(|_| "null".into());
+    format!("{key}={encoded}")
+}
+
 fn shell_quote(s: &str) -> String {
     if !s.is_empty()
         && s.bytes()
@@ -671,4 +858,26 @@ fn shell_quote(s: &str) -> String {
         return s.to_owned();
     }
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_ephemeral_plan_update_trace_event() {
+        let raw = r#"{"v":1,"ts":"2026-11-28T00:00:00Z","pid":123,"ppid":100,"agent":"anix-agent","type":"plan_update","steps":[{"title":"Inspect","status":"done"},{"title":"Implement","status":"in_progress"},{"title":"Verify","status":"pending"}]}"#;
+        let ev = parse_trace_line("main", raw).expect("parse plan_update");
+        match ev {
+            WorkerEvent::PlanUpdate { worker_id, steps } => {
+                assert_eq!(worker_id, "main");
+                assert_eq!(steps.len(), 3);
+                assert_eq!(steps[0].status, PlanStepStatus::Done);
+                assert_eq!(steps[1].title, "Implement");
+                assert_eq!(steps[1].status, PlanStepStatus::InProgress);
+                assert_eq!(steps[2].status, PlanStepStatus::Pending);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
 }

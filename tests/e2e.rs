@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use anix_agent::approve::{ApprovalResponseWire, ApprovalServer, PendingApproval, try_auto_decide};
 use anix_agent::cli::ApprovalPolicy;
 use anix_agent::wal_view::{WalGraph, load_recent_replay};
-use anix_agent::worker::{WorkerEvent, WorkerHandle, WorkerSpec, ensure_maildir, run_anix_fork};
+use anix_agent::worker::{
+    WorkerEvent, WorkerHandle, WorkerMessage, WorkerSpec, ensure_maildir, run_anix_fork,
+};
 
 fn anix_agent_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_anix-agent"))
@@ -289,7 +291,7 @@ for line in sys.stdin:
     );
 
     // Start ApprovalServer routing decisions automatically for safe cmds, editing tc_edit, denying tc_deny!
-    let (ev_tx, ev_rx) = mpsc::channel::<WorkerEvent>();
+    let (ev_tx, ev_rx) = mpsc::channel::<WorkerMessage>();
     let server = ApprovalServer::start(&root, move |pending| {
         let always = HashSet::new();
         if let Some(auto) = try_auto_decide(ApprovalPolicy::Ask, &always, &pending.cmd) {
@@ -324,6 +326,8 @@ for line in sys.stdin:
             config_file: Some(cfg_path.clone()),
             provider: Some("mock".into()),
             model: Some("mock-v1".into()),
+            reasoning_effort: None,
+            effort_params: None,
             base_shell: Some("/bin/sh".into()),
             approve_sock: server.socket_path().to_path_buf(),
             sandbox: None,
@@ -347,8 +351,8 @@ for line in sys.stdin:
 
     let deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < deadline {
-        if let Ok(ev) = ev_rx.recv_timeout(Duration::from_millis(200)) {
-            match ev {
+        if let Ok(msg) = ev_rx.recv_timeout(Duration::from_millis(200)) {
+            match msg.event {
                 WorkerEvent::ReasoningDelta { text, .. } if !text.is_empty() => {
                     saw_reasoning = true;
                 }
@@ -408,8 +412,8 @@ for line in sys.stdin:
     let mut saw_compact = false;
     let compact_deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < compact_deadline {
-        if let Ok(ev) = ev_rx.recv_timeout(Duration::from_millis(200)) {
-            match ev {
+        if let Ok(msg) = ev_rx.recv_timeout(Duration::from_millis(200)) {
+            match msg.event {
                 WorkerEvent::Compact {
                     worker_id, leaf_id, ..
                 } if worker_id == "main" => {
@@ -456,6 +460,11 @@ for line in sys.stdin:
             config_file: Some(cfg_path.clone()),
             provider: Some("mock".into()),
             model: Some("mock-v1".into()),
+            reasoning_effort: Some("xhigh".into()),
+            effort_params: Some(vec![
+                ("reasoning_effort".into(), serde_json::json!("xhigh")),
+                ("thinking".into(), serde_json::json!({ "type": "enabled" })),
+            ]),
             base_shell: Some("/bin/sh".into()),
             approve_sock: server.socket_path().to_path_buf(),
             sandbox: None,
@@ -471,10 +480,24 @@ for line in sys.stdin:
         .expect("deliver prompt to w1");
 
     let mut main_notified_reply = String::new();
+    let mut saw_w1_resumed_run_start = false;
     let notify_deadline = Instant::now() + Duration::from_secs(20);
     while Instant::now() < notify_deadline {
-        if let Ok(ev) = ev_rx.recv_timeout(Duration::from_millis(200)) {
-            match ev {
+        if let Ok(msg) = ev_rx.recv_timeout(Duration::from_millis(200)) {
+            match msg.event {
+                WorkerEvent::RunStart {
+                    worker_id,
+                    session_usage,
+                    context,
+                    ..
+                } if worker_id == "w1" => {
+                    let has_usage =
+                        session_usage.is_some_and(|u| u.input_tokens > 0 || u.output_tokens > 0);
+                    let has_ctx = context.is_some_and(|c| c.tokens > 0 && c.max_tokens > 0);
+                    if has_usage && has_ctx {
+                        saw_w1_resumed_run_start = true;
+                    }
+                }
                 WorkerEvent::TextDelta { worker_id, text } if worker_id == "main" => {
                     main_notified_reply.push_str(&text);
                 }
@@ -488,12 +511,28 @@ for line in sys.stdin:
         }
     }
     assert!(
+        saw_w1_resumed_run_start,
+        "expected forked/resumed worker RunStart to carry non-zero session_usage and context watermark"
+    );
+    assert!(
         main_notified_reply.contains("Main received w1 completion via Maildir notify"),
         "expected main to wake via --notify Maildir callback, got: {main_notified_reply:?}"
     );
 
+    // Drain any buffered events before intentional stop, then verify stop(SIGTERM) emits no exit=143.
+    while ev_rx.try_recv().is_ok() {}
     w1.stop(libc::SIGTERM);
     main_worker.stop(libc::SIGTERM);
+    let drain_deadline = Instant::now() + Duration::from_millis(250);
+    while Instant::now() < drain_deadline {
+        if let Ok(msg) = ev_rx.recv_timeout(Duration::from_millis(50)) {
+            assert!(
+                !matches!(msg.event, WorkerEvent::Exited { exit_code: 143, .. }),
+                "intentional stop(SIGTERM) must not leak Exited(143): {:?}",
+                msg
+            );
+        }
+    }
     drop(server);
     let _ = fs::remove_dir_all(&root);
 }

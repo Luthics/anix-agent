@@ -52,6 +52,7 @@ pub const DEFAULT_SAFE_COMMANDS: &[&str] = &[
     "anix fsck",
     "aclr",
     "aview",
+    "aplan",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -371,6 +372,9 @@ pub fn matches_safe_commands(cmd: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
+    if is_safe_aplan_heredoc(trimmed) {
+        return true;
+    }
     let Some(segments) = split_safe_pipeline(trimmed) else {
         return false;
     };
@@ -378,6 +382,74 @@ pub fn matches_safe_commands(cmd: &str) -> bool {
         return false;
     }
     segments.iter().all(|seg| segment_is_safe(seg))
+}
+
+/// Strictly validate `aplan <<'EOF'\n...\nEOF` (and safe unquoted heredocs without shell
+/// expansions) so the agent can update the ephemeral live progress checklist without triggering
+/// approval prompts in `ask` mode or being blocked in `plan` mode.
+fn is_safe_aplan_heredoc(cmd: &str) -> bool {
+    let mut lines: Vec<&str> = cmd.lines().collect();
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    if lines.len() < 2 {
+        return false;
+    }
+    let first = lines[0].trim();
+    let Some(after_cmd) = first.strip_prefix("aplan") else {
+        return false;
+    };
+    if !after_cmd.starts_with(char::is_whitespace) {
+        return false;
+    }
+    let rest = after_cmd.trim();
+    let Some(after_redir) = rest.strip_prefix("<<") else {
+        return false;
+    };
+    let (strip_tabs, raw_delim) = match after_redir.strip_prefix('-') {
+        Some(r) => (true, r.trim()),
+        None => (false, after_redir.trim()),
+    };
+    if raw_delim.is_empty() {
+        return false;
+    }
+    let (quoted, delim) = if raw_delim.len() >= 2
+        && ((raw_delim.starts_with('\'') && raw_delim.ends_with('\''))
+            || (raw_delim.starts_with('"') && raw_delim.ends_with('"')))
+    {
+        (true, &raw_delim[1..raw_delim.len() - 1])
+    } else {
+        (false, raw_delim)
+    };
+    if delim.is_empty()
+        || !delim
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+    {
+        return false;
+    }
+    let matches_delim = |line: &str| {
+        if strip_tabs {
+            line.trim_start_matches('\t') == delim
+        } else {
+            line == delim
+        }
+    };
+    let last_idx = lines.len() - 1;
+    if !matches_delim(lines[last_idx]) {
+        return false;
+    }
+    for &body_line in &lines[1..last_idx] {
+        // Reject early delimiter termination (prevents smuggled commands after the heredoc).
+        if matches_delim(body_line) {
+            return false;
+        }
+        // Unquoted heredocs perform `$()` / backtick / `$VAR` expansion in POSIX sh.
+        if !quoted && body_line.contains(['$', '`', '\\']) {
+            return false;
+        }
+    }
+    true
 }
 
 pub fn is_single_simple_command(cmd: &str) -> bool {
@@ -548,6 +620,21 @@ mod tests {
         assert!(matches_safe_commands("ls -la | grep Cargo | head -n 5"));
         assert!(matches_safe_commands("git status"));
         assert!(matches_safe_commands("git diff --stat"));
+        assert!(matches_safe_commands("aplan -d 'Read code' -i 'Edit file'"));
+        assert!(matches_safe_commands("aplan clear"));
+        assert!(matches_safe_commands(
+            "aplan <<'EOF'\n- [x] Inspect auth\n- [~] Fix refresh $(safe literal)\n- [ ] Verify\nEOF"
+        ));
+        assert!(matches_safe_commands(
+            "aplan <<EOF\n- [x] Inspect auth\n- [ ] Verify\nEOF"
+        ));
+        assert!(!matches_safe_commands(
+            "aplan <<EOF\n- [x] $(rm -rf /)\nEOF"
+        ));
+        assert!(!matches_safe_commands(
+            "aplan <<'EOF'\n- [x] ok\nEOF\nrm -rf /tmp/x"
+        ));
+        assert!(!matches_safe_commands("aplan <<'EOF'; rm -rf /tmp/x\nEOF"));
         assert!(!matches_safe_commands("rm -rf /tmp/x"));
         assert!(!matches_safe_commands("ls > out.txt"));
         assert!(!matches_safe_commands("echo $(whoami)"));
