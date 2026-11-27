@@ -25,7 +25,9 @@ use crate::approve::{
     ApprovalResponseWire, ApprovalServer, PendingApproval, extract_argv0, try_auto_decide,
 };
 use crate::cli::{ApprovalPolicy, Cli};
-use crate::input::{InputAction, InputBox};
+use crate::input::{
+    COMPLETION_VISIBLE_ROWS, CompletionContext, CompletionMenu, InputAction, InputBox,
+};
 use crate::markdown::{render_markdown, wrap_prefixed_lines};
 use crate::session::{
     SessionMeta, SessionStore, SessionSummary, now_rfc3339, resolve_anix_bin, save_session_meta,
@@ -35,7 +37,7 @@ use crate::worker::{
     TrackedHold, WorkerEvent, WorkerHandle, WorkerSpec, ensure_maildir, run_anix_fork,
 };
 
-const VIEWPORT_HEIGHT: u16 = 12;
+const VIEWPORT_HEIGHT: u16 = 13;
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 enum AppEvent {
@@ -1207,18 +1209,27 @@ impl Workbench {
             return self.handle_overlay_key(terminal, key);
         }
 
-        if key.code == KeyCode::Esc {
+        if key.code == KeyCode::Esc && self.input.completion().is_none() {
             self.hint_line = None;
             return Ok(());
         }
 
-        // Priority 3: Multi-line input box
-        match self.input.handle_key(key, &self.store.cwd) {
+        // Priority 3: Multi-line input box with live `/command` & `@path` dropdown palette
+        let agent_names: Vec<String> = self
+            .store
+            .list_available_agents()
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        let worker_names: Vec<String> = self.workers.keys().cloned().collect();
+        let comp_ctx = CompletionContext {
+            cwd: &self.store.cwd,
+            agents: &agent_names,
+            workers: &worker_names,
+        };
+        match self.input.handle_key(key, comp_ctx) {
             InputAction::None => {
                 self.hint_line = None;
-            }
-            InputAction::CompletionHint(h) => {
-                self.hint_line = Some(h);
             }
             InputAction::Submit(raw) => {
                 self.hint_line = None;
@@ -1713,7 +1724,7 @@ Keys:
                     Ok(())
                 }
             }
-            "/sessions" => {
+            "/sessions" | "/resume" => {
                 let items = self.store.list_sessions();
                 if items.is_empty() {
                     self.push_notice(terminal, Color::DarkGray, "no saved sessions yet")
@@ -1855,7 +1866,7 @@ Keys:
                     Err(msg) => self.push_notice(terminal, Color::Red, msg),
                 }
             }
-            "/new" => {
+            "/new" | "/clear" => {
                 let (dir, meta) = self.store.create_session(
                     self.meta.agent_path.clone(),
                     self.meta.model.clone(),
@@ -2104,11 +2115,32 @@ Keys:
 
     fn render(&self, f: &mut Frame<'_>) {
         let area = f.area();
+
+        // When the live slash / `@path` completion palette is open, dock the sleek prompt
+        // directly above the live dropdown (Claude Code / Antigravity CLI style).
+        if self.active_approval.is_none()
+            && matches!(self.overlay, Overlay::None)
+            && let Some(menu) = self.input.completion()
+        {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3), // Ruled prompt line (`─` + `> /...` + `─`)
+                    Constraint::Min(7),    // Live completion rows + `↓ N more` + nav footer
+                    Constraint::Length(1), // 1-line live status bar
+                ])
+                .split(area);
+            self.render_input_box(f, chunks[0]);
+            self.render_completion_palette(f, menu, chunks[1]);
+            self.render_status_bar(f, chunks[2]);
+            return;
+        }
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(5),    // Live streaming / Approval Card / Overlay
-                Constraint::Length(4), // Multi-line input box
+                Constraint::Length(4), // Multi-line ruled input area
                 Constraint::Length(1), // 1-line live status bar
             ])
             .split(area);
@@ -2134,6 +2166,77 @@ Keys:
 
         self.render_input_box(f, chunks[1]);
         self.render_status_bar(f, chunks[2]);
+    }
+
+    fn render_completion_palette(&self, f: &mut Frame<'_>, menu: &CompletionMenu, area: Rect) {
+        let visible_rows = COMPLETION_VISIBLE_ROWS.min(area.height.saturating_sub(2) as usize);
+        let col_width = 24usize.min((area.width as usize / 2).max(14));
+        let desc_max = (area.width as usize).saturating_sub(col_width + 4).max(10);
+
+        let mut lines = Vec::with_capacity(visible_rows + 3);
+        for (offset, item) in menu.visible_slice(visible_rows).iter().enumerate() {
+            let abs_idx = menu.scroll + offset;
+            let is_sel = abs_idx == menu.selected;
+            let indicator = if is_sel { "> " } else { "  " };
+            let label = pad_display_width(&item.label, col_width);
+            let desc = truncate_single_line(&item.description, desc_max);
+
+            let (ind_style, lbl_style, desc_style) = if is_sel {
+                (
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::White),
+                )
+            } else {
+                (
+                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::White),
+                    Style::default().fg(Color::Gray),
+                )
+            };
+            lines.push(Line::from(vec![
+                Span::styled(indicator, ind_style),
+                Span::styled(label, lbl_style),
+                Span::raw("  "),
+                Span::styled(desc, desc_style),
+            ]));
+        }
+
+        let above = menu.hidden_above();
+        let below = menu.hidden_below(visible_rows);
+        if above > 0 || below > 0 {
+            let mut parts = Vec::new();
+            if above > 0 {
+                parts.push(format!("↑ {above} more"));
+            }
+            if below > 0 {
+                parts.push(format!("↓ {below} more"));
+            }
+            lines.push(Line::from(Span::styled(
+                format!("  {}", parts.join(" · ")),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
+        if lines.len() + 1 < area.height as usize {
+            lines.push(Line::default());
+        }
+        lines.push(Line::from(vec![
+            Span::styled("  ↑/↓ ", Style::default().fg(Color::White)),
+            Span::styled("Navigate · ", Style::default().fg(Color::DarkGray)),
+            Span::styled("enter ", Style::default().fg(Color::White)),
+            Span::styled("Select · ", Style::default().fg(Color::DarkGray)),
+            Span::styled("tab ", Style::default().fg(Color::White)),
+            Span::styled("Complete · ", Style::default().fg(Color::DarkGray)),
+            Span::styled("esc ", Style::default().fg(Color::White)),
+            Span::styled("Cancel", Style::default().fg(Color::DarkGray)),
+        ]));
+
+        f.render_widget(Paragraph::new(lines), area);
     }
 
     fn render_live_stream(&self, f: &mut Frame<'_>, area: Rect) {
@@ -2468,45 +2571,74 @@ Keys:
     }
 
     fn render_input_box(&self, f: &mut Frame<'_>, area: Rect) {
-        let prompt_title = if self.focused_worker == "main" {
-            " › Prompt (Enter send · Alt+Enter newline) ".to_owned()
+        let prefix = if self.focused_worker == "main" {
+            "> ".to_owned()
         } else {
-            format!(" › [{}] Prompt ", self.focused_worker)
+            format!("> [{}] ", self.focused_worker)
         };
-        let border_color =
-            if self.active_approval.is_some() || !matches!(self.overlay, Overlay::None) {
-                Color::DarkGray
-            } else {
-                Color::Cyan
-            };
+        let prefix_w = prefix.width();
+        let is_focused = self.active_approval.is_none() && matches!(self.overlay, Overlay::None);
+        let prefix_color = if is_focused {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        };
         let block = Block::default()
-            .title(Span::styled(
-                prompt_title,
-                Style::default().fg(border_color),
-            ))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(border_color));
+            .borders(Borders::TOP | Borders::BOTTOM)
+            .border_style(Style::default().fg(Color::DarkGray));
 
         let inner = block.inner(area);
-        let (visual_lines, (cur_row, cur_col)) =
-            self.input.visual_lines_and_cursor(inner.width as usize);
+        let text_w = (inner.width as usize).saturating_sub(prefix_w).max(4);
+        let (visual_lines, (cur_row, cur_col)) = self.input.visual_lines_and_cursor(text_w);
         let max_rows = inner.height.max(1) as usize;
         let scroll_y = if cur_row >= max_rows {
             cur_row + 1 - max_rows
         } else {
             0
         };
-        let visible: Vec<Line<'static>> = visual_lines
-            .into_iter()
-            .skip(scroll_y)
-            .take(max_rows)
-            .map(Line::from)
-            .collect();
+        let cont_pad = " ".repeat(prefix_w);
+        let show_placeholder = self.input.is_empty() && is_focused;
+        let visible: Vec<Line<'static>> = if show_placeholder {
+            vec![Line::from(vec![
+                Span::styled(
+                    prefix,
+                    Style::default()
+                        .fg(prefix_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    "Type a prompt, `/` for commands, or `@` for files…",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])]
+        } else {
+            visual_lines
+                .into_iter()
+                .enumerate()
+                .skip(scroll_y)
+                .take(max_rows)
+                .map(|(row_idx, line)| {
+                    if row_idx == 0 {
+                        Line::from(vec![
+                            Span::styled(
+                                prefix.clone(),
+                                Style::default()
+                                    .fg(prefix_color)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw(line),
+                        ])
+                    } else {
+                        Line::from(vec![Span::raw(cont_pad.clone()), Span::raw(line)])
+                    }
+                })
+                .collect()
+        };
 
         f.render_widget(Paragraph::new(visible).block(block), area);
 
-        if self.active_approval.is_none() && matches!(self.overlay, Overlay::None) {
-            let cx = inner.x + (cur_col as u16).min(inner.width.saturating_sub(1));
+        if is_focused {
+            let cx = inner.x + ((prefix_w + cur_col) as u16).min(inner.width.saturating_sub(1));
             let cy = inner.y + ((cur_row - scroll_y) as u16).min(inner.height.saturating_sub(1));
             f.set_cursor_position((cx, cy));
         }
@@ -2639,6 +2771,16 @@ fn tail_preview(s: &str, max_cols: usize) -> String {
     }
     rev_chars.reverse();
     format!("…{}", rev_chars.into_iter().collect::<String>())
+}
+
+fn pad_display_width(raw: &str, target_cols: usize) -> String {
+    let clipped = truncate_single_line(raw, target_cols);
+    let w = clipped.width();
+    if w >= target_cols {
+        clipped
+    } else {
+        format!("{clipped}{}", " ".repeat(target_cols - w))
+    }
 }
 
 fn truncate_single_line(raw: &str, max_cols: usize) -> String {
