@@ -10,7 +10,7 @@ checksum = "57b212daf2e827b1ccdd778b7eb48ba433e58cb0e4f27b43cd6b7a608425a014"
 
 [[package]]
 name = "anix-agent"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anix-proto",
  "clap",
@@ -28,8 +28,8 @@ dependencies = [
 
 [[package]]
 name = "anix-proto"
-version = "0.0.8"
-source = "git+https://github.com/Luthics/anix.git?branch=main#98e7d6c2317e1ad12a3813890735379a52a3cb1a"
+version = "0.0.9"
+source = "git+https://github.com/Luthics/anix.git?branch=main#c10e8b21fa17f3f880a28b8848388a2befb81fda"
 dependencies = [
  "serde",
  "serde_json",

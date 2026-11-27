@@ -1,6 +1,6 @@
 [package]
 name = "anix-agent"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Lightweight POSIX-native interactive terminal workbench (Layer 3) for the Anix OS Agent kernel"

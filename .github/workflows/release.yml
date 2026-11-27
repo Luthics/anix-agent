@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            musl: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            musl: true
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            musl: false
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            musl: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl-tools
+        if: matrix.musl
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Verify static linkage (Linux musl)
+        if: matrix.musl
+        run: |
+          BIN="target/${{ matrix.target }}/release/anix-agent"
+          file "${BIN}"
+          if ldd "${BIN}" 2>&1 | grep -q '=>'; then
+            echo "ERROR: anix-agent is dynamically linked" >&2
+            exit 1
+          fi
+
+      - name: Package archive
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            TAG="dev-${GITHUB_SHA::7}"
+          fi
+          STAGE="dist/anix-agent-${TAG}-${{ matrix.target }}"
+          BIN_DIR="target/${{ matrix.target }}/release"
+
+          install -d -m 0755 "${STAGE}/bin"
+          install -m 0755 "${BIN_DIR}/anix-agent" "${STAGE}/bin/anix-agent"
+          install -m 0644 LICENSE README.md "${STAGE}/"
+
+          mkdir -p artifacts
+          tar -C dist -czf "artifacts/anix-agent-${TAG}-${{ matrix.target }}.tar.gz" "anix-agent-${TAG}-${{ matrix.target }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: artifacts/*.tar.gz
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        working-directory: artifacts
+        run: sha256sum *.tar.gz > SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS.txt
